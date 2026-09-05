@@ -13,6 +13,8 @@ from plumbmate.save_lineage import (
     select_restorable_memory,
 )
 
+VERIFIED_BUILD = "1.127.41.1230"
+
 
 class SaveLineageTests(unittest.TestCase):
     def setUp(self):
@@ -259,12 +261,55 @@ class SaveLineageTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         replace(original, **{field: value})
 
+    def test_reserved_autosave_slot_is_hinted_only_on_an_inspected_build(self):
+        current = replace(
+            self.current, slot_id="Slot_ffffffff.save", game_build=VERIFIED_BUILD,
+        )
+        result = self.assess_verified(
+            current, commits=[replace(self.commit, slot_id="Slot_ffffffff")],
+        )
+        self.assertIn(LineageHint.AUTOSAVE_SLOT_OBSERVED, result.hints)
+        self.assertTrue(result.can_restore)
+
+    def test_autosave_hint_needs_the_build_that_certifies_the_reserved_value(self):
+        for build in (None, "1.128.0.1000"):
+            with self.subTest(build=build):
+                result = assess_save_lineage(
+                    replace(self.current, slot_id="Slot_ffffffff.save", game_build=build),
+                )
+                self.assertNotIn(LineageHint.AUTOSAVE_SLOT_OBSERVED, result.hints)
+
+    def test_unparseable_slot_name_yields_no_autosave_hint(self):
+        result = assess_save_lineage(replace(self.current, game_build=VERIFIED_BUILD))
+        self.assertNotIn(LineageHint.AUTOSAVE_SLOT_OBSERVED, result.hints)
+
+    def test_backup_suffixes_are_the_same_slot_not_a_slot_change(self):
+        current = replace(self.current, slot_id="Slot_ffffffff.save")
+        previous = replace(self.previous, slot_id="SLOT_FFFFFFFF.save.ver4")
+        result = assess_save_lineage(
+            current, previous=previous,
+            commits=[replace(self.commit, slot_id="Slot_ffffffff")],
+            provenance=self.provenance,
+        )
+        self.assertNotIn(LineageHint.SLOT_CHANGED, result.hints)
+        self.assertIn(LineageHint.TICKS_ADVANCED, result.hints)
+        self.assertTrue(result.can_restore)
+
+    def test_autosave_slot_alone_still_cannot_restore(self):
+        result = assess_save_lineage(
+            replace(self.current, slot_id="Slot_ffffffff.save", game_build=VERIFIED_BUILD),
+            previous=self.previous, commits=[self.commit],
+        )
+        self.assert_unresolved(result, "load_provenance_unverified")
+        self.assertIn(LineageHint.AUTOSAVE_SLOT_OBSERVED, result.hints)
+
     def test_empty_identity_and_nonboolean_verification_are_rejected(self):
         for original, field, value in (
             (self.current, "load_id", " "), (self.current, "slot_id", ""),
             (self.commit, "save_scope_id", ""), (self.commit, "state", "COMMITTED"),
             (self.provenance, "evidence_id", ""), (self.memory, "record_id", None),
             (self.provenance, "verified", "true"), (self.commit, "verified", 1),
+            (self.current, "game_build", ""),
         ):
             with self.subTest(field=field, value=value):
                 with self.assertRaises(ValueError):

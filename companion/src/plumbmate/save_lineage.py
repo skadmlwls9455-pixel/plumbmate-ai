@@ -4,6 +4,10 @@ Slot, active household, and ticks are cross-checks, never save identity. A trust
 adapter must independently verify both the committed boundary and its connection
 to this exact load before setting either ``verified`` flag. No current game hook
 produces that evidence; these types define the companion-side contract only.
+
+Reserved-autosave classification is reported as a hint only. An autosave is one
+kind of save, not a separate lineage, so the slot's storage kind never grants,
+blocks, or branches a restore.
 """
 
 from __future__ import annotations
@@ -11,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
+
+from .save_slots import StorageSlotKind, classify_save_slot
 
 
 def _identifier(name: str, value: str | None, *, optional: bool = False) -> None:
@@ -46,6 +52,7 @@ class LineageHint(str, Enum):
     TICKS_REGRESSED = "TICKS_REGRESSED"
     TICKS_EQUAL = "TICKS_EQUAL"
     TICKS_ADVANCED = "TICKS_ADVANCED"
+    AUTOSAVE_SLOT_OBSERVED = "AUTOSAVE_SLOT_OBSERVED"
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,8 @@ class SaveObservation:
     ``load_id`` must change on every load, including reloads within one session.
     ``household_id`` denotes the active household; it can change during play.
     Missing metadata stays missing and is never inferred from the previous load.
+    ``game_build`` is the build the adapter reported for this load; without it a
+    slot cannot be classified, because the reserved value is build-scoped.
     """
 
     session_id: str
@@ -62,6 +71,7 @@ class SaveObservation:
     slot_id: str | None
     household_id: str | None
     ticks: int | None
+    game_build: str | None = None
 
     def __post_init__(self) -> None:
         _identifier("session_id", self.session_id)
@@ -69,6 +79,7 @@ class SaveObservation:
         _identifier("slot_id", self.slot_id, optional=True)
         _identifier("household_id", self.household_id, optional=True)
         _sequence("ticks", self.ticks, optional=True)
+        _identifier("game_build", self.game_build, optional=True)
 
 
 @dataclass(frozen=True)
@@ -151,6 +162,38 @@ class LineageAssessment:
         return self.status is LineageStatus.VERIFIED_LOAD and self.restore_boundary is not None
 
 
+def _slot_key(slot_id: str | None) -> str | None:
+    """Canonical slot key when the name parses, otherwise the raw string.
+
+    Normalizing makes Slot_ffffffff, Slot_ffffffff.save and Slot_ffffffff.save.ver0
+    compare equal instead of producing a spurious slot mismatch. Values the slot
+    grammar does not cover are compared verbatim and are never coerced.
+    """
+    if slot_id is None:
+        return None
+    try:
+        return classify_save_slot(slot_id).canonical_id
+    except ValueError:
+        return slot_id
+
+
+def _reserved_autosave_slot(observation: SaveObservation) -> bool:
+    """True only for the reserved autosave value on an inspected build.
+
+    An unparseable slot, a missing build, or an uninspected build is not a
+    negative finding; it simply produces no hint.
+    """
+    if observation.slot_id is None or observation.game_build is None:
+        return False
+    try:
+        classification = classify_save_slot(
+            observation.slot_id, game_build=observation.game_build,
+        )
+    except ValueError:
+        return False
+    return classification.storage_kind is StorageSlotKind.ENGINE_AUTOSAVE_RESERVED
+
+
 def _cross_checks(
     current: SaveObservation, previous: SaveObservation | None,
 ) -> tuple[LineageHint, ...]:
@@ -164,6 +207,8 @@ def _cross_checks(
         for observation in observations
     ):
         hints.append(LineageHint.INCOMPLETE_OBSERVATION)
+    if _reserved_autosave_slot(current):
+        hints.append(LineageHint.AUTOSAVE_SLOT_OBSERVED)
     if previous is None:
         return tuple(hints)
     if current.household_id is not None and previous.household_id is not None:
@@ -171,7 +216,7 @@ def _cross_checks(
             hints.append(LineageHint.HOUSEHOLD_CHANGED)
     if current.slot_id is None or previous.slot_id is None:
         return tuple(hints)
-    if current.slot_id != previous.slot_id:
+    if _slot_key(current.slot_id) != _slot_key(previous.slot_id):
         hints.append(LineageHint.SLOT_CHANGED)
         # Game clocks in different slots have no ordered relationship.
         return tuple(hints)
@@ -226,7 +271,7 @@ def assess_save_lineage(
         return unresolved("commit_boundary_mismatch")
     if current.slot_id is None or current.ticks is None:
         return unresolved("save_cross_check_missing")
-    if current.slot_id != commit.slot_id:
+    if _slot_key(current.slot_id) != _slot_key(commit.slot_id):
         return unresolved("save_slot_mismatch")
     if current.ticks < commit.ticks:
         return unresolved("observed_before_commit")
