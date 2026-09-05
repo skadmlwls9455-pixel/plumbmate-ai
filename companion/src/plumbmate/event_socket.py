@@ -43,6 +43,7 @@ LOOPBACK_HOST = "127.0.0.1"
 TOKEN_ENVIRONMENT_VARIABLE = "PLUMBMATE_BRIDGE_TOKEN"
 TOKEN_FILENAME = "bridge-token"
 ENDPOINT_FILENAME = "bridge-endpoint.json"
+DEFAULT_BRIDGE_PORT = 47651
 
 MIN_TOKEN_CHARACTERS = 32
 NONCE_BYTES = 32
@@ -87,10 +88,10 @@ def endpoint_path(paths: BridgePaths) -> Path:
 
 
 def write_endpoint(paths: BridgePaths, host: str, port: int) -> Path:
-    """Publish where the listener is, so the game side need not guess a port.
+    """Persist connection configuration, retained across listener restarts.
 
     This is a convenience for discovery, never an authorization: a peer still
-    has to answer the challenge. The file carries no secret.
+    has to answer the challenge. File existence does NOT imply a live listener.
     """
     paths.ensure()
     target = endpoint_path(paths)
@@ -100,10 +101,34 @@ def write_endpoint(paths: BridgePaths, host: str, port: int) -> Path:
 
 
 def clear_endpoint(paths: BridgePaths) -> None:
+    """Explicit configuration reset only; never call on listener shutdown."""
     try:
         endpoint_path(paths).unlink()
     except OSError:
         pass
+
+
+def configured_port(paths: BridgePaths, requested: int | None = None) -> int:
+    """Reuse the last port; fail visibly on conflict instead of silently moving.
+
+    Explicit port 0 remains available for tests/manual discovery. The game must
+    explicitly reload configuration after a deliberate port or token change.
+    """
+    if requested is not None:
+        if not 0 <= requested <= 65535:
+            raise SocketBridgeError("Port must be between 0 and 65535")
+        return requested
+    try:
+        with endpoint_path(paths).open(encoding="utf-8") as handle:
+            endpoint = json.loads(handle.read(4097))
+        port = int(endpoint["port"])
+        if endpoint.get("host", LOOPBACK_HOST) != LOOPBACK_HOST or not 1 <= port <= 65535:
+            raise ValueError("Invalid loopback endpoint")
+        return port
+    except FileNotFoundError:
+        return DEFAULT_BRIDGE_PORT
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise SocketBridgeError("Invalid stored endpoint; choose an explicit --port") from exc
 
 
 def write_token(paths: BridgePaths, token: str | None = None) -> str:
@@ -229,10 +254,12 @@ class _FrameStream:
         while True:
             index = self._buffer.find(b"\n")
             if index >= 0:
+                if index + 1 > self._max_bytes:
+                    raise ProtocolError("Frame exceeds the maximum size")
                 raw = bytes(self._buffer[:index])
                 del self._buffer[: index + 1]
                 return _decode_frame(raw)
-            if len(self._buffer) > self._max_bytes:
+            if len(self._buffer) >= self._max_bytes:
                 raise ProtocolError("Frame exceeds the maximum size")
             chunk = self._connection.recv(4096)
             if not chunk:
@@ -241,7 +268,7 @@ class _FrameStream:
 
     def write_frame(self, value: dict[str, Any]) -> None:
         data = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        if len(data) > self._max_bytes:
+        if len(data) + 1 > self._max_bytes:
             raise ProtocolError("Frame exceeds the maximum size")
         self._connection.sendall(data + b"\n")
 

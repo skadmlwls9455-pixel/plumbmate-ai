@@ -38,19 +38,34 @@ snapshot. Action execution is intentionally disabled in this first milestone.
 ## Event socket
 
 Alongside the file bridge, the mod opens a loopback socket to the companion so
-the game can push events as they happen. It needs no cheat command: the mod
-hooks `Zone.update` when it loads and connects on its own once `plumbmate
-listen` is running, following the companion to a new port if it restarts.
-Until then the hook is idle and connects to nothing.
+the game adapter can send events (automatic gameplay observation is still
+pending). Provision the bridge token before launching the game. The mod hooks
+`Zone.update` at load and connects when `plumbmate listen` starts, even if the
+companion starts later. Disconnections retry with bounded exponential backoff.
+
+The CLI reuses the configured port, initially `127.0.0.1:47651`. It retains
+`state/bridge-endpoint.json` on exit; this is configuration, **not** proof that
+the companion is running. The game reads configuration at mod load or explicit
+start only: no filesystem reads, stats, directory creation, or worker threads
+on the tick path. On a port conflict, the CLI fails visibly rather than moving
+silently or stopping another process. Deliberately changing `--port` (including
+manual `--port 0` discovery), creating a missing token after game load, or
+rotating it requires `plumbmate.bridge.start` or a game restart.
 
 - `plumbmate.status` — whether the bridge is available, hooked, and connected.
 - `plumbmate.bridge.status` — connection state, counters, and last error.
-- `plumbmate.bridge.stop` — unhook for the rest of the session.
+- `plumbmate.bridge.stop` — stop binding/pumping until explicit start or game
+  restart. Remove only our exact outermost hook; leave foreign wrappers intact
+  and disable our retained inner wrapper.
+- `plumbmate.bridge.start` — explicitly reload local configuration and resume.
 - To keep autostart off from the start, create an empty file named
   `autostart-disabled` in `PlumbMateBridge/state/`.
 
 The socket is loopback-only and authenticated per connection with an HMAC
 answer to the server's nonce; the token itself is never sent.
+
+See [bridge reliability fixes and verification](docs/BRIDGE_FIXES_2026-09-05_KO.md)
+for the four reviewed defects, regression coverage, and remaining in-game checks.
 
 ## Repository layout
 

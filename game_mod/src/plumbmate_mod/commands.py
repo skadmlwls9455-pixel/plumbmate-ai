@@ -42,6 +42,7 @@ except Exception as _exc:
 
 
 PROTOCOL_VERSION = "0.1"
+MOD_VERSION = "0.1.1-alpha.1"
 ARCHIVE_SUFFIX = ".ts4script"
 DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
@@ -49,10 +50,12 @@ AUTOSTART_DISABLE_FILE = "autostart-disabled"
 # Initialized at import; idle until a client is bound, by autostart or by hand.
 TICK_DRIVER = plumbmate_tick_driver.TickDriver() if plumbmate_tick_driver else None
 
-# The endpoint the bound client was built for, so the binder can tell a live
-# client from one aimed at a companion that has since restarted on a new port.
+# Configuration is read only at mod load or by an explicit start command.
+# The tick path never opens/stats files, creates directories, or spawns workers.
 _BOUND_ENDPOINT = None
+_BOOTSTRAP_CLIENT = None
 AUTOSTART_STATE = "not_attempted"
+_LAST_REQUEST_ID = None
 
 
 def _mod_directory():
@@ -127,6 +130,7 @@ def _snapshot(sim):
 
 
 def _write_request(sim, message):
+    global _LAST_REQUEST_ID
     root = _ensure_directories()
     actor, household = _snapshot(sim)
     request_id = uuid.uuid4().hex
@@ -136,7 +140,9 @@ def _write_request(sim, message):
         "kind": "turn",
         "created_at": datetime.datetime.utcnow().isoformat() + "Z",
         "player_message": _safe_text(message)[:1000],
-        "session_id": "household-{}".format(getattr(sim.household, "id", "local")),
+        # Until save lineage receipts are implemented, a household ID cannot
+        # authorize cross-save memory reuse. This alpha isolates each turn.
+        "session_id": "turn-" + request_id,
         "game": {"adapter": "plumbmate-ts4-prototype"},
         "actor": actor,
         "household": household,
@@ -148,41 +154,61 @@ def _write_request(sim, message):
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(temporary, target)
+    _LAST_REQUEST_ID = request_id
     return target
 
 
 def _latest_response():
-    root = _ensure_directories()
-    response_dir = os.path.join(root, "responses")
-    candidates = []
-    for name in os.listdir(response_dir):
-        if name.endswith(".json"):
-            path = os.path.join(response_dir, name)
-            candidates.append((os.path.getmtime(path), path))
-    if not candidates:
+    if _LAST_REQUEST_ID is None:
         return None
-    path = max(candidates)[1]
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    path = os.path.join(_bridge_directory(), "responses", _LAST_REQUEST_ID + ".json")
+    if not os.path.isfile(path):
+        return None
+    if os.path.islink(path):
+        raise ValueError("Symlinked responses are not accepted")
+    with open(path, "rb") as handle:
+        raw = handle.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("Response exceeds size limit")
+    response = json.loads(raw.decode("utf-8"))
+    if (not isinstance(response, dict) or response.get("request_id") != _LAST_REQUEST_ID
+            or response.get("protocol_version") != PROTOCOL_VERSION):
+        raise ValueError("Response does not match the pending turn")
+    if not isinstance(response.get("partner_message"), str) or len(response["partner_message"]) > 500:
+        raise ValueError("Invalid response text")
+    action = response.get("action")
+    if not isinstance(action, dict) or action.get("name") not in (
+            "suggest_only", "queue_social", "queue_self_interaction", "cancel_current"):
+        raise ValueError("Invalid action suggestion")
+    return response
 
 
 def _state_file(name):
-    return os.path.join(_ensure_directories(), "state", name)
+    return os.path.join(_bridge_directory(), "state", name)
 
 
 def _read_token():
     with open(_state_file("bridge-token"), "r", encoding="utf-8") as handle:
-        return handle.read().strip()
+        token = handle.read(4097).strip()
+    if len(token) > 4096:
+        raise ValueError("Bridge token file is too large")
+    return token
 
 
 def _read_endpoint():
-    """Discover the companion's port; the file carries no secret."""
+    """Read persistent configuration, NOT a file-based liveness signal."""
     try:
         with open(_state_file("bridge-endpoint.json"), "r", encoding="utf-8") as handle:
-            endpoint = json.load(handle)
+            endpoint = json.loads(handle.read(4097))
         return endpoint.get("host", "127.0.0.1"), int(endpoint["port"])
-    except Exception:
+    except FileNotFoundError:
         return "127.0.0.1", DEFAULT_BRIDGE_PORT
+
+
+def _load_bootstrap():
+    token = _read_token()
+    host, port = _read_endpoint()
+    return plumbmate_bridge_client.BridgeClient(token, port, host=host), (host, port)
 
 
 def _bridge_reason():
@@ -212,22 +238,6 @@ def _hook_installed():
                 and plumbmate_tick_driver.is_hooked(zone.Zone, "update"))
 
 
-def _live_endpoint():
-    """Return (host, port) only while the companion is publishing an endpoint.
-
-    ``plumbmate listen`` writes this file on start and deletes it on exit, and
-    it asks the kernel for a free port by default, so the file is both the
-    liveness signal and the only way to learn the current port. Its absence is
-    the ordinary case of "the companion is not running", not an error.
-    """
-    try:
-        with open(_state_file("bridge-endpoint.json"), "r", encoding="utf-8") as handle:
-            endpoint = json.load(handle)
-        return endpoint.get("host", "127.0.0.1"), int(endpoint["port"])
-    except Exception:
-        return None
-
-
 def _autostart_disabled():
     """A file beside the token turns autostart off before the game loads."""
     try:
@@ -237,43 +247,25 @@ def _autostart_disabled():
 
 
 def _autostart_binder(current):
-    """Supply the tick driver with a client. Returns None to change nothing.
-
-    Called from the tick hook on the engine thread every few seconds, so it
-    only stats a couple of files and builds a client when the endpoint it is
-    bound to is not the one the companion is currently publishing.
-    """
-    global _BOUND_ENDPOINT, AUTOSTART_STATE
-    endpoint = _live_endpoint()
-    if endpoint is None:
-        AUTOSTART_STATE = "waiting_for_companion"
+    """Memory-only binding. Socket state, not a file, determines liveness."""
+    global AUTOSTART_STATE
+    if _BOOTSTRAP_CLIENT is None:
         return None
-    if current is not None and _BOUND_ENDPOINT == endpoint:
-        AUTOSTART_STATE = "bound"
-        return None
-    try:
-        token = _read_token()
-    except Exception:
-        AUTOSTART_STATE = "waiting_for_token"
-        return None
-    client = plumbmate_bridge_client.BridgeClient(token, endpoint[1], host=endpoint[0])
-    if current is not None:
-        # The endpoint moved; the old socket has nothing left to reach.
-        current.close()
-    _BOUND_ENDPOINT = endpoint
-    AUTOSTART_STATE = "bound"
-    return client
+    AUTOSTART_STATE = "bound" if current is not None and current.connected else "waiting_for_companion"
+    return _BOOTSTRAP_CLIENT if current is None else None
 
 
 def start_autostart():
     """Hook Zone.update at mod load and let the binder connect when it can.
 
-    Installing the hook with nothing bound costs one wrapper call per tick and
-    connects to nothing; the driver stays idle until the companion appears.
+    Read configuration once here. A configured client retries the same numeric
+    loopback endpoint with backoff even when the companion starts later.
+    Creating/rotating the token or changing the port later requires an explicit
+    plumbmate.bridge.start (or a game restart), never filesystem polling.
     Any failure here is reported through plumbmate.status rather than raised,
     because an exception during mod import would take the whole mod down.
     """
-    global AUTOSTART_STATE
+    global AUTOSTART_STATE, _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT
     if _autostart_disabled():
         AUTOSTART_STATE = "disabled_by_file"
         return False
@@ -282,12 +274,19 @@ def start_autostart():
         AUTOSTART_STATE = "unavailable: {}".format(reason)
         return False
     try:
+        _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT = _load_bootstrap()
+        AUTOSTART_STATE = "waiting_for_companion"
+    except FileNotFoundError:
+        AUTOSTART_STATE = "waiting_for_token"
+    except Exception:
+        AUTOSTART_STATE = "invalid_bridge_config"
+    try:
         TICK_DRIVER.set_binder(_autostart_binder)
+        TICK_DRIVER.resume()
         plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
     except Exception as exc:
         AUTOSTART_STATE = "hook_failed: {}: {}".format(type(exc).__name__, exc)
         return False
-    AUTOSTART_STATE = "waiting_for_companion"
     return True
 
 
@@ -297,53 +296,62 @@ def plumbmate_bridge_start(_connection=None):
 
     Autostart normally does this at mod load; this stays for a forced rebind.
     """
-    global _BOUND_ENDPOINT
+    global _BOUND_ENDPOINT, _BOOTSTRAP_CLIENT, AUTOSTART_STATE
     output = sims4.commands.CheatOutput(_connection)
     if not _bridge_available():
         output("PlumbMate: socket bridge unavailable in this build.")
         return
     try:
-        token = _read_token()
-    except Exception:
+        client, endpoint = _load_bootstrap()
+    except FileNotFoundError:
         output("PlumbMate: no bridge token. Run 'plumbmate token' in the companion.")
         return
-    host, port = _read_endpoint()
+    except Exception:
+        output("PlumbMate: invalid bridge configuration. Check the local token and loopback port.")
+        return
     try:
+        # Install/reuse only our wrapper; do not modify another mod's chain.
+        plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
         previous = TICK_DRIVER.detach()
         if previous is not None:
             previous.close()
-        TICK_DRIVER.attach(plumbmate_bridge_client.BridgeClient(token, port, host=host))
-        # A hand-bound client is only "current" if it matches the live endpoint;
-        # otherwise leave the marker unset so the binder replaces it later.
-        _BOUND_ENDPOINT = _live_endpoint()
-        # Zone.update(self, absolute_ticks); the wrapper runs the original first.
-        plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
+        _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT = client, endpoint
+        TICK_DRIVER.attach(client)
+        TICK_DRIVER.set_binder(_autostart_binder)
+        TICK_DRIVER.resume()
+        AUTOSTART_STATE = "waiting_for_companion"
     except Exception as exc:
         output("PlumbMate bridge start failed: {}".format(_safe_text(exc)))
         return
-    output("PlumbMate bridge started: {}:{} | tick hook installed".format(host, port))
+    output("PlumbMate bridge started: {}:{} | tick hook installed".format(*endpoint))
 
 
 @sims4.commands.Command("plumbmate.bridge.stop", command_type=sims4.commands.CommandType.Live)
 def plumbmate_bridge_stop(_connection=None):
-    """Unhook and unbind. Also stops autostart, which only runs from the hook."""
-    global _BOUND_ENDPOINT, AUTOSTART_STATE
+    """Stop independently of socket availability or third-party wrapping."""
+    global _BOUND_ENDPOINT, _BOOTSTRAP_CLIENT, AUTOSTART_STATE
     output = sims4.commands.CheatOutput(_connection)
-    if not _bridge_available():
-        output("PlumbMate: socket bridge unavailable in this build.")
-        return
+    AUTOSTART_STATE = "stopped_by_command"
+    _BOUND_ENDPOINT = None
+    bootstrap, _BOOTSTRAP_CLIENT = _BOOTSTRAP_CLIENT, None
     try:
-        plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update")
-        client = TICK_DRIVER.detach()
+        client = None
+        if TICK_DRIVER is not None:
+            TICK_DRIVER.suspend()
+            TICK_DRIVER.set_binder(None)
+            client = TICK_DRIVER.detach()
+        restored = bool(zone is not None and plumbmate_tick_driver is not None
+                        and plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update"))
         if client is not None:
             client.close()
-        _BOUND_ENDPOINT = None
-        AUTOSTART_STATE = "stopped_by_command"
+        if bootstrap is not None and bootstrap is not client:
+            bootstrap.close()
     except Exception as exc:
         output("PlumbMate bridge stop failed: {}".format(_safe_text(exc)))
         return
-    output("PlumbMate bridge stopped; Zone.update restored. "
-           "Autostart resumes on the next game start.")
+    output("PlumbMate bridge stopped; {}. Use plumbmate.bridge.start to resume, "
+           "or restart the game.".format(
+               "owned hook restored" if restored else "foreign hooks left unchanged"))
 
 
 @sims4.commands.Command("plumbmate.bridge.status", command_type=sims4.commands.CommandType.Live)
@@ -386,7 +394,7 @@ def plumbmate_bridge_ping(_connection=None):
 def plumbmate_status(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
     root = _ensure_directories()
-    output("PlumbMate prototype 0.1 | bridge: {}".format(root))
+    output("PlumbMate {} | bridge: {}".format(MOD_VERSION, root))
     available, reason = _bridge_reason()
     output("socket bridge: {} ({})".format(
         "available" if available else "unavailable", reason))

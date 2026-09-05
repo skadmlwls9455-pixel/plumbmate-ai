@@ -14,13 +14,14 @@ from .event_socket import (
     ALLOWED_EVENT_KINDS,
     BridgeClient,
     EventSocketServer,
-    clear_endpoint,
+    SocketBridgeError,
+    configured_port,
     load_token,
     token_path,
     write_endpoint,
     write_token,
 )
-from .protocol import BridgePaths, PROTOCOL_VERSION, atomic_write_json, read_json
+from .protocol import BridgePaths, PROTOCOL_VERSION, ProtocolError, atomic_write_json, read_json
 from .providers import create_provider
 
 
@@ -55,12 +56,12 @@ def main(argv: list[str] | None = None) -> int:
 
     commands = (
         "init", "demo", "serve-once", "serve", "show-latest",
-        "token", "listen", "mock-event",
+        "token", "listen", "run", "mock-event",
     )
     for command in commands:
         sub = subparsers.add_parser(command)
         sub.add_argument("--bridge", required=True, help="Local bridge directory")
-        if command in {"serve-once", "serve"}:
+        if command in {"serve-once", "serve", "run"}:
             sub.add_argument("--provider", choices=("mock", "openai"), default="mock")
         if command == "demo":
             sub.add_argument("--message", default="에이든, 오늘 우리 뭐 하면서 놀까?")
@@ -68,9 +69,13 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--interval", type=float, default=0.75)
         if command == "token":
             sub.add_argument("--rotate", action="store_true", help="Replace the stored token")
-        if command == "listen":
-            sub.add_argument("--port", type=int, default=0, help="0 asks for a free port")
+        if command in {"listen", "run"}:
+            sub.add_argument("--port", type=int, default=None,
+                             help="Reuse configured port (initially 47651); 0 is manual discovery")
             sub.add_argument("--events", type=int, default=0, help="Stop after N events")
+        if command == "run":
+            sub.add_argument("--max-turns", type=int, default=20,
+                             help="Maximum model attempts this session; no silent automatic retries")
         if command == "mock-event":
             sub.add_argument("--port", type=int, required=True)
             sub.add_argument("--kind", choices=sorted(ALLOWED_EVENT_KINDS), default="heartbeat")
@@ -97,7 +102,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         try:
             while True:
-                result = engine.process_one()
+                try:
+                    result = engine.process_one()
+                except ProtocolError as exc:
+                    print(str(exc), flush=True)
+                    continue
                 if result:
                     print(result, flush=True)
                 else:
@@ -110,15 +119,42 @@ def main(argv: list[str] | None = None) -> int:
             write_token(paths)
         print(load_token(paths))
         return 0
-    if args.command == "listen":
+    if args.command in {"listen", "run"}:
+        engine = None
+        if args.command == "run":
+            if args.max_turns < 1:
+                print("--max-turns must be positive")
+                return 2
+            engine = CompanionEngine(paths, create_provider(args.provider))
         # The socket layer is loopback-only and refuses to start without a token.
-        with EventSocketServer(load_token(paths), port=args.port) as server:
+        try:
+            server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port))
+            server.start()
+        except (OSError, SocketBridgeError) as exc:
+            print(f"Listener not started: {exc}. Check the token/configuration and port owner; "
+                  "no process was stopped and no alternate port was chosen.")
+            return 2
+        try:
             write_endpoint(paths, "127.0.0.1", server.port)
             print(f"listening on 127.0.0.1:{server.port}", flush=True)
             seen = 0
+            attempts = 0
             try:
                 while args.events <= 0 or seen < args.events:
-                    event = server.poll(timeout=0.5)
+                    if engine is not None and attempts < args.max_turns:
+                        # Count uncertain failures too; never retry them.
+                        try:
+                            result = engine.process_one()
+                        except ProtocolError as exc:
+                            attempts += 1
+                            print(str(exc), flush=True)
+                        else:
+                            if result is not None:
+                                attempts += 1
+                                print("turn completed", flush=True)
+                        if attempts >= args.max_turns:
+                            print("Session turn limit reached; no further model calls. Restart explicitly to continue.", flush=True)
+                    event = server.poll(timeout=0.25)
                     if event is None:
                         continue
                     seen += 1
@@ -128,8 +164,10 @@ def main(argv: list[str] | None = None) -> int:
                     }, ensure_ascii=False), flush=True)
             except KeyboardInterrupt:
                 pass
-            finally:
-                clear_endpoint(paths)
+        finally:
+            server.stop()
+            # Keep configuration: a later launch must reach the same endpoint
+            # cached by the game, without disk polling on the engine thread.
         return 0
     if args.command == "mock-event":
         payload = json.loads(args.payload)
@@ -151,4 +189,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

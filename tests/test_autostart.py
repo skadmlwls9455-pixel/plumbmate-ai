@@ -7,11 +7,12 @@ directory so its own bridge-path resolution runs for real.
 
 Stubs stand in for ``services``, ``sims4.commands`` and ``zone``. They prove
 nothing about the real engine; what they let us test is the part that is ours,
-namely that a hook installed with nothing listening stays idle, picks up a
-companion that appears later, and follows it to a new port after a restart.
+namely that preconfigured clients reconnect to the same port without file I/O
+on ticks. Deliberate token/port changes are reloaded only by an explicit start.
 """
 
 import importlib.util
+import functools
 import json
 import os
 import shutil
@@ -20,6 +21,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from plumbmate.event_socket import MIN_TOKEN_CHARACTERS, EventSocketServer
@@ -120,7 +122,7 @@ class AutostartTests(unittest.TestCase):
 
     def _unhook(self, module):
         try:
-            sys.modules["plumbmate_tick_driver"].remove_tick_hook(self.zone_class, "update")
+            module.plumbmate_bridge_stop()
         except Exception:
             pass
 
@@ -155,7 +157,7 @@ class AutostartTests(unittest.TestCase):
     def test_import_alone_installs_the_hook(self):
         module = self.boot()
         self.assertTrue(module._hook_installed())
-        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_companion")
+        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_token")
         self.assertIsNone(module.TICK_DRIVER.client)
 
     def test_no_companion_means_ticks_stay_idle_and_harmless(self):
@@ -166,16 +168,15 @@ class AutostartTests(unittest.TestCase):
         self.assertIsNone(module.TICK_DRIVER.client)
         self.assertEqual(module.TICK_DRIVER.stats["pumps"], 0)
         self.assertEqual(module.TICK_DRIVER.stats["bind_errors"], 0)
-        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_companion")
+        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_token")
 
-    def test_a_token_without_a_listener_still_binds_nothing(self):
+    def test_a_token_without_endpoint_uses_the_stable_default(self):
         self.write_token()
         module = self.boot()
-        zone = self.zone_class()
-        for tick in range(50):
-            zone.update(tick)
-        # The endpoint file is the liveness signal; a token alone is not one.
-        self.assertIsNone(module.TICK_DRIVER.client)
+        client = module._autostart_binder(None)
+        self.assertIsNotNone(client)
+        self.assertEqual(client._port, module.DEFAULT_BRIDGE_PORT)
+        self.assertFalse(client.connected)
         self.assertEqual(module.AUTOSTART_STATE, "waiting_for_companion")
 
     def test_a_listener_without_a_token_reports_why_it_waits(self):
@@ -191,22 +192,28 @@ class AutostartTests(unittest.TestCase):
         self.assertEqual(module.AUTOSTART_STATE, "waiting_for_token")
 
     def test_a_companion_started_after_the_game_is_picked_up(self):
+        # Installation provisions credentials/configuration before game load.
+        reservation = EventSocketServer(TOKEN)
+        reservation.start()
+        port = reservation.port
+        reservation.stop()
+        self.write_token()
+        self.write_endpoint(port)
         module = self.boot()
         zone = self.zone_class()
         for tick in range(20):
             zone.update(tick)
-        self.assertIsNone(module.TICK_DRIVER.client)
+        self.assertFalse(module.TICK_DRIVER.client.connected)
 
-        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server = EventSocketServer(TOKEN, port=port, idle_timeout=60.0)
         server.start()
         self.addCleanup(server.stop)
-        self.write_token()
-        self.write_endpoint(server.port)
 
         self.assertTrue(self.tick_until(
             zone, lambda: module.TICK_DRIVER.client is not None
             and module.TICK_DRIVER.client.connected
         ), "autostart never connected")
+        zone.update(21)
         self.assertEqual(module.AUTOSTART_STATE, "bound")
 
         event_id = module.TICK_DRIVER.client.queue_event("heartbeat", {"source": "autostart"})
@@ -217,7 +224,7 @@ class AutostartTests(unittest.TestCase):
         self.assertEqual(received.event_id, event_id)
         self.assertEqual(received.payload, {"source": "autostart"})
 
-    def test_a_companion_restart_on_a_new_port_is_followed(self):
+    def test_a_companion_restart_on_the_same_port_reuses_the_client(self):
         first = EventSocketServer(TOKEN, idle_timeout=60.0)
         first.start()
         self.addCleanup(first.stop)
@@ -231,29 +238,96 @@ class AutostartTests(unittest.TestCase):
         ))
         original = module.TICK_DRIVER.client
 
-        # 'plumbmate listen' asks the kernel for a port, so a restart moves it.
+        # A normal CLI restart reuses persistent configuration, not a new port.
         first_port = first.port
         first.stop()
-        self.clear_endpoint()
-        second = EventSocketServer(TOKEN, idle_timeout=60.0)
+        second = EventSocketServer(TOKEN, port=first_port, idle_timeout=60.0)
         second.start()
         self.addCleanup(second.stop)
-        self.assertNotEqual(second.port, first_port)
-        self.write_endpoint(second.port)
 
         self.assertTrue(self.tick_until(
-            zone, lambda: module.TICK_DRIVER.client is not original
-            and module.TICK_DRIVER.client is not None
-            and module.TICK_DRIVER.client.connected,
+            zone, lambda: original.connected and original.stats["handshakes"] == 2,
             timeout=25.0,
-        ), "never rebound to the new port")
-        self.assertEqual(module.TICK_DRIVER.stats["binds"], 2)
+        ), "never reconnected to the same port")
+        self.assertIs(module.TICK_DRIVER.client, original)
+        self.assertEqual(module.TICK_DRIVER.stats["binds"], 1)
 
         module.TICK_DRIVER.client.queue_event("heartbeat", {"source": "rebind"})
         self.assertTrue(self.tick_until(
             zone, lambda: module.TICK_DRIVER.client.stats["acked_events"] == 1
         ))
         self.assertEqual(second.poll(timeout=15.0).payload, {"source": "rebind"})
+
+    def test_deliberate_port_change_requires_explicit_reload(self):
+        with EventSocketServer(TOKEN) as first, EventSocketServer(TOKEN) as second:
+            self.write_token()
+            self.write_endpoint(first.port)
+            module = self.boot()
+            zone = self.zone_class()
+            self.assertTrue(self.tick_until(zone, lambda: module.TICK_DRIVER.client.connected))
+            original = module.TICK_DRIVER.client
+            self.write_endpoint(second.port)
+            for tick in range(30):
+                zone.update(tick)
+            self.assertIs(module.TICK_DRIVER.client, original)
+            module.plumbmate_bridge_start()
+            self.assertTrue(self.tick_until(zone, lambda: module.TICK_DRIVER.client.connected))
+            self.assertIsNot(module.TICK_DRIVER.client, original)
+            self.assertEqual(module.TICK_DRIVER.client._port, second.port)
+            self.assertEqual(original.state, "CLOSED")
+
+    def test_late_token_is_loaded_by_explicit_start_only(self):
+        module = self.boot()
+        self.write_token()
+        with EventSocketServer(TOKEN) as server:
+            self.write_endpoint(server.port)
+            zone = self.zone_class()
+            zone.update(1)
+            self.assertIsNone(module.TICK_DRIVER.client)
+            module.plumbmate_bridge_start()
+            self.assertTrue(self.tick_until(zone, lambda: module.TICK_DRIVER.client.connected))
+
+    def test_no_filesystem_operations_on_ticks_even_while_binding(self):
+        self.write_token()
+        module = self.boot()
+        client = mock.Mock(connected=False)
+        module._BOOTSTRAP_CLIENT = client
+        zone = self.zone_class()
+        with mock.patch("builtins.open", side_effect=AssertionError("tick file read")) as read, \
+             mock.patch("os.path.exists", side_effect=AssertionError("tick stat")) as exists, \
+             mock.patch("os.path.isdir", side_effect=AssertionError("tick stat")) as isdir, \
+             mock.patch("os.makedirs", side_effect=AssertionError("tick mkdir")) as mkdir:
+            for tick in range(200):
+                self.assertEqual(zone.update(tick), "engine-result")
+            for operation in (read, exists, isdir, mkdir):
+                operation.assert_not_called()
+        self.assertEqual(module.TICK_DRIVER.stats["bind_errors"], 0)
+        self.assertEqual(client.pump.call_count, 200)
+
+    def test_bad_configuration_stays_idle_until_explicitly_fixed(self):
+        self.write_token()
+        self.write_endpoint(70000)
+        module = self.boot()
+        self.zone_class().update(1)
+        self.assertIsNone(module.TICK_DRIVER.client)
+        self.assertEqual(module.AUTOSTART_STATE, "invalid_bridge_config")
+
+    def test_read_only_returns_the_exact_pending_response(self):
+        module = self.boot()
+        responses = self.state.parent / "responses"
+        responses.mkdir(parents=True, exist_ok=True)
+        module._LAST_REQUEST_ID = "a" * 32
+        unrelated = {"protocol_version": "0.1", "request_id": "b" * 32,
+                     "partner_message": "wrong turn", "action": {"name": "suggest_only"}}
+        (responses / ("b" * 32 + ".json")).write_text(json.dumps(unrelated), encoding="utf-8")
+        self.assertIsNone(module._latest_response())
+        target = responses / ("a" * 32 + ".json")
+        target.write_text(json.dumps(unrelated), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            module._latest_response()
+        matched = dict(unrelated, request_id="a" * 32, partner_message="right turn")
+        target.write_text(json.dumps(matched), encoding="utf-8")
+        self.assertEqual(module._latest_response()["partner_message"], "right turn")
 
     def test_a_stable_endpoint_is_not_rebound_every_attempt(self):
         server = EventSocketServer(TOKEN, idle_timeout=60.0)
@@ -303,6 +377,46 @@ class AutostartTests(unittest.TestCase):
             self.assertEqual(zone.update(tick), "engine-result")
         # With the hook gone the binder never runs again this session.
         self.assertEqual(module.TICK_DRIVER.stats["binds"], binds)
+
+    def _stop_under_foreign_wrapper(self, copy_markers):
+        self.write_token()
+        module = self.boot()
+        inner = self.zone_class.update
+        calls = []
+
+        def foreign(zone, tick):
+            calls.append(tick)
+            return inner(zone, tick)
+        if copy_markers:
+            foreign = functools.wraps(inner)(foreign)
+        self.zone_class.update = foreign
+        # Stop must work even when a new socket cannot be created.
+        with mock.patch.object(module, "_bridge_available", return_value=False):
+            module.plumbmate_bridge_stop()
+        binds = module.TICK_DRIVER.stats["binds"]
+        zone = self.zone_class()
+        for tick in range(100):
+            self.assertEqual(zone.update(tick), "engine-result")
+            module.TICK_DRIVER.on_tick(tick)  # also defend direct stale callbacks
+        self.assertIs(self.zone_class.update, foreign)
+        self.assertEqual(len(calls), 100)
+        self.assertIsNone(module.TICK_DRIVER.client)
+        self.assertEqual(module.TICK_DRIVER.stats["binds"], binds)
+        self.assertEqual(module.AUTOSTART_STATE, "stopped_by_command")
+        # Explicit start is the only way back; it must not double-pump.
+        with EventSocketServer(TOKEN) as server:
+            self.write_endpoint(server.port)
+            module.plumbmate_bridge_start()
+            self.assertTrue(self.tick_until(zone, lambda: module.TICK_DRIVER.client.connected))
+            pumps = module.TICK_DRIVER.stats["pumps"]
+            zone.update(999)
+            self.assertEqual(module.TICK_DRIVER.stats["pumps"], pumps + 1)
+
+    def test_stop_under_unmarked_foreign_wrapper_cannot_rebind(self):
+        self._stop_under_foreign_wrapper(False)
+
+    def test_stop_preserves_foreign_wrapper_with_copied_markers(self):
+        self._stop_under_foreign_wrapper(True)
 
 
 if __name__ == "__main__":

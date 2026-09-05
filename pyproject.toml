@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plumbmate-ai"
-version = "0.1.0"
+version = "0.1.1a1"
 description = "Local-first AI companion bridge for a life simulation game"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,4 +20,3 @@ package-dir = {"" = "companion/src"}
 
 [tool.setuptools.packages.find]
 where = ["companion/src"]
-

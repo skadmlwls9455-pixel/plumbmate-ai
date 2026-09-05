@@ -150,6 +150,8 @@ class BridgeClient(object):
         self._token = token
         self._host = host
         self._port = int(port)
+        if not 1 <= self._port <= 65535:
+            raise ValueError("Bridge port must be between 1 and 65535")
         self._now = now or time.monotonic
         self._connect_timeout = connect_timeout
         self._handshake_timeout = handshake_timeout
@@ -296,9 +298,28 @@ class BridgeClient(object):
     def _read_frames(self):
         read_bytes = 0
         frames = 0
-        while read_bytes < MAX_READ_BYTES_PER_PUMP and frames < MAX_FRAMES_PER_PUMP:
+        while frames < MAX_FRAMES_PER_PUMP:
+            # A previous pump may have hit its frame budget with complete
+            # frames still buffered. Drain those BEFORE recv/EAGAIN/EOF.
+            index = self._inbound.find(b"\n")
+            if index >= 0:
+                if index + 1 > self._max_frame_bytes:
+                    self._fail("frame_too_large")
+                    return
+                raw = bytes(self._inbound[:index])
+                del self._inbound[: index + 1]
+                frames += 1
+                self._handle_frame(raw)
+                if self.state in (BACKOFF, CLOSED):
+                    return
+                continue
+            if len(self._inbound) >= self._max_frame_bytes:
+                self._fail("frame_too_large")
+                return
+            if read_bytes >= MAX_READ_BYTES_PER_PUMP:
+                return
             try:
-                chunk = self._socket.recv(4096)
+                chunk = self._socket.recv(min(4096, MAX_READ_BYTES_PER_PUMP - read_bytes))
             except OSError as exc:
                 if exc.errno in _RETRY_LATER:
                     return
@@ -309,18 +330,6 @@ class BridgeClient(object):
                 return
             read_bytes += len(chunk)
             self._inbound.extend(chunk)
-            while frames < MAX_FRAMES_PER_PUMP:
-                index = self._inbound.find(b"\n")
-                if index < 0:
-                    if len(self._inbound) > self._max_frame_bytes:
-                        self._fail("frame_too_large")
-                    return
-                raw = bytes(self._inbound[:index])
-                del self._inbound[: index + 1]
-                frames += 1
-                self._handle_frame(raw)
-                if self.state in (BACKOFF, CLOSED):
-                    return
 
     def _handle_frame(self, raw):
         try:
@@ -359,8 +368,10 @@ class BridgeClient(object):
                 self.stats["unknown_frames"] += 1
 
     def _resolve(self, event_id, accepted, reason):
-        if event_id in self._pending:
-            self._pending.remove(event_id)
+        if event_id not in self._pending:
+            self.stats["unknown_frames"] += 1
+            return
+        self._pending.remove(event_id)
         if accepted:
             self.stats["acked_events"] += 1
         else:
