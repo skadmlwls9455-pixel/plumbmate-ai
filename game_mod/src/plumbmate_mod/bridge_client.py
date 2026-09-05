@@ -52,6 +52,9 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 30.0
+# Must stay well under the companion's idle timeout (300s), or a quiet game
+# session cycles through disconnect/reconnect every idle-timeout forever.
+KEEPALIVE_INTERVAL_SECONDS = 120.0
 
 # Must stay identical to the companion's transport allow list. It bounds what
 # the socket carries and says nothing about whether an event may be acted on.
@@ -140,6 +143,7 @@ class BridgeClient(object):
         max_backoff=MAX_BACKOFF_SECONDS,
         max_outbox=MAX_OUTBOX_EVENTS,
         max_frame_bytes=MAX_FRAME_BYTES,
+        keepalive_interval=KEEPALIVE_INTERVAL_SECONDS,
     ):
         if not isinstance(token, str) or len(token.strip()) < MIN_TOKEN_CHARACTERS:
             raise ValueError(
@@ -157,6 +161,8 @@ class BridgeClient(object):
         self._max_backoff = max_backoff
         self._max_outbox = max_outbox
         self._max_frame_bytes = max_frame_bytes
+        self._keepalive_interval = float(keepalive_interval)
+        self._next_keepalive = 0.0
 
         self.state = DISCONNECTED
         self.last_error = None
@@ -275,9 +281,23 @@ class BridgeClient(object):
             return
         self._read_frames()
         if self.state == READY:
+            self._maybe_keepalive(now)
             self._encode_outbox()
         if self._socket is not None:
             self._flush_outbound()
+
+    def _maybe_keepalive(self, now):
+        """Queue a heartbeat so an idle connection outlives the server's idle
+        timeout. Any traffic resets that timeout, so nothing is queued while
+        real events are flowing; an interval of 0 disables keepalives."""
+        if self._keepalive_interval <= 0:
+            return
+        if self._outbox or self._pending or self._outbound:
+            self._next_keepalive = now + self._keepalive_interval
+            return
+        if now >= self._next_keepalive:
+            self.queue_event("heartbeat", {"source": "keepalive"})
+            self._next_keepalive = now + self._keepalive_interval
 
     def _start_connect(self, now):
         self._close_socket()
@@ -372,6 +392,7 @@ class BridgeClient(object):
             self.state = READY
             self._backoff = 0.0
             self.last_error = None
+            self._next_keepalive = self._now() + self._keepalive_interval
             self.stats["handshakes"] += 1
         elif self.state == READY:
             if kind == "ack":
@@ -382,8 +403,14 @@ class BridgeClient(object):
                 self.stats["unknown_frames"] += 1
 
     def _resolve(self, event_id, accepted, reason):
-        if event_id in self._pending:
-            self._pending.remove(event_id)
+        if event_id not in self._pending:
+            # A duplicate or fabricated ack must not inflate delivery stats,
+            # but an error frame keeps its diagnostic value either way.
+            self.stats["unknown_frames"] += 1
+            if not accepted and reason:
+                self.last_error = reason
+            return
+        self._pending.remove(event_id)
         if accepted:
             self.stats["acked_events"] += 1
         else:

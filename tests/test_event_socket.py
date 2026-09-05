@@ -336,6 +336,18 @@ class LifecycleTests(unittest.TestCase):
         self.addCleanup(replacement.stop)
         self.assertEqual(replacement.port, port)
 
+    def test_a_stopped_server_can_start_again_and_serve(self):
+        # A stale stop flag would make the restarted server accept nothing
+        # while looking perfectly healthy.
+        server = EventSocketServer(TOKEN)
+        server.start()
+        server.stop()
+        server.start()
+        self.addCleanup(server.stop)
+        with BridgeClient(TOKEN, server.port, timeout=30.0) as client:
+            self.assertEqual(client.send_event("heartbeat")["kind"], "ack")
+        self.assertIsNotNone(server.poll(timeout=15.0))
+
 
 if __name__ == "__main__":
     unittest.main()

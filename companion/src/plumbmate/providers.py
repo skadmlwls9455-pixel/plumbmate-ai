@@ -90,7 +90,10 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 class OpenAIResponsesProvider:
     api_key: str
     model: str
-    max_output_tokens: int = 220
+    # The strict schema allows a 500-character Korean partner_message plus the
+    # action object; Korean runs 1-2 tokens per character, so 220 truncated
+    # ordinary replies. 400 fits the schema's own maximums with headroom.
+    max_output_tokens: int = 400
     endpoint: str = "https://api.openai.com/v1/responses"
 
     @classmethod
@@ -150,6 +153,17 @@ class OpenAIResponsesProvider:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProtocolError(f"OpenAI request failed: {exc}") from exc
 
+        status = raw.get("status")
+        if status and status != "completed":
+            # Truncation (max_output_tokens) otherwise surfaces as a confusing
+            # "output was not valid JSON"; name the real cause instead.
+            details = raw.get("incomplete_details") or {}
+            reason = details.get("reason")
+            raise ProtocolError(
+                "OpenAI response status was {}{}".format(
+                    status, f" ({reason})" if reason else ""
+                )
+            )
         output_text = raw.get("output_text") or self._extract_output_text(raw)
         if not output_text:
             raise ProtocolError("OpenAI response did not contain output_text")

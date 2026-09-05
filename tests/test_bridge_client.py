@@ -222,6 +222,77 @@ class FrameBurstTests(unittest.TestCase):
         self.assertEqual(client.state, "READY")
 
 
+class KeepaliveTests(unittest.TestCase):
+    """An idle READY connection must outlive the companion's idle timeout."""
+
+    def _ready_client(self, **kwargs):
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        clock = Clock()
+        client = bridge.BridgeClient(
+            TOKEN, server.port, now=clock,
+            connect_timeout=30.0, handshake_timeout=30.0, **kwargs,
+        )
+        self.addCleanup(client.close)
+        self.assertTrue(pump_until(client, lambda: client.connected))
+        return server, clock, client
+
+    def test_idle_ready_connection_sends_a_keepalive_heartbeat(self):
+        server, clock, client = self._ready_client()
+        self.assertEqual(client.stats["queued_events"], 0)
+        clock.advance(bridge.KEEPALIVE_INTERVAL_SECONDS + 1.0)
+        self.assertTrue(
+            pump_until(client, lambda: client.stats["acked_events"] == 1),
+            "keepalive was never sent or acked: {}".format(client.last_error),
+        )
+        event = server.poll(timeout=15.0)
+        self.assertEqual(event.kind, "heartbeat")
+        self.assertEqual(event.payload, {"source": "keepalive"})
+
+    def test_zero_interval_disables_keepalives(self):
+        _server, clock, client = self._ready_client(keepalive_interval=0)
+        clock.advance(10_000.0)
+        for _ in range(20):
+            client.pump()
+            time.sleep(0.005)
+        self.assertEqual(client.stats["queued_events"], 0)
+        self.assertTrue(client.connected)
+
+
+class ResolveStatsTests(unittest.TestCase):
+    """Acks for events that were never pending must not inflate delivery stats."""
+
+    def test_a_fabricated_ack_counts_as_an_unknown_frame(self):
+        client = bridge.BridgeClient(TOKEN, 1)
+        self.addCleanup(client.close)
+        frame = json.dumps({
+            "protocol_version": bridge.PROTOCOL_VERSION,
+            "kind": "ack", "event_id": "never-sent",
+        }).encode("utf-8") + b"\n"
+
+        class OneFrameSocket(object):
+            def __init__(self):
+                self.chunks = [frame]
+
+            def recv(self, _size):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise OSError(errno.EAGAIN, "drained")
+
+            def send(self, data):
+                return len(data)
+
+            def close(self):
+                pass
+
+        client._socket = OneFrameSocket()
+        client.state = bridge.READY
+        client.pump()
+        self.assertEqual(client.stats["acked_events"], 0)
+        self.assertEqual(client.stats["unknown_frames"], 1)
+
+
 class AdoptOutboxTests(unittest.TestCase):
     """A replacement client takes over the old client's unsent events."""
 

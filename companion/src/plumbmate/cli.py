@@ -23,7 +23,13 @@ from .event_socket import (
     write_endpoint,
     write_token,
 )
-from .protocol import BridgePaths, PROTOCOL_VERSION, atomic_write_json, read_json
+from .protocol import (
+    BridgePaths,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    atomic_write_json,
+    read_json,
+)
 from .providers import create_provider
 
 
@@ -93,7 +99,13 @@ def main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
     if args.command in {"serve-once", "serve"}:
-        engine = CompanionEngine(paths, create_provider(args.provider))
+        try:
+            provider = create_provider(args.provider)
+        except ProtocolError as exc:
+            # Missing OPENAI_API_KEY etc. deserves one clear line, not a stack.
+            print(f"cannot start provider '{args.provider}': {exc}", file=sys.stderr)
+            return 2
+        engine = CompanionEngine(paths, provider)
         if args.command == "serve-once":
             result = engine.process_one()
             for notice in engine.drain_notices():

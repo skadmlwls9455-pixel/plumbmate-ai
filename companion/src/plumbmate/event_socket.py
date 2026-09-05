@@ -323,6 +323,9 @@ class EventSocketServer:
     def start(self) -> None:
         if self._listener is not None:
             raise SocketBridgeError("Server is already started")
+        # A stopped server can start again; without this it would accept
+        # nothing while looking perfectly healthy.
+        self._stopping.clear()
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
