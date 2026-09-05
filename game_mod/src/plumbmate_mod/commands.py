@@ -9,9 +9,29 @@ import uuid
 import services
 import sims4.commands
 
+# The build publishes these as root-level modules, like the diagnostic probe.
+# A partial or stale install must degrade to the filesystem bridge, not break
+# the whole mod at import, so both imports are guarded.
+try:
+    import plumbmate_bridge_client
+except Exception:
+    plumbmate_bridge_client = None
+try:
+    import plumbmate_tick_driver
+except Exception:
+    plumbmate_tick_driver = None
+try:
+    import zone
+except Exception:
+    zone = None
+
 
 PROTOCOL_VERSION = "0.1"
 ARCHIVE_SUFFIX = ".ts4script"
+DEFAULT_BRIDGE_PORT = 47651
+
+# Initialized at import; idle until plumbmate.bridge.start binds a client.
+TICK_DRIVER = plumbmate_tick_driver.TickDriver() if plumbmate_tick_driver else None
 
 
 def _mod_directory():
@@ -125,11 +145,117 @@ def _latest_response():
         return json.load(handle)
 
 
+def _state_file(name):
+    return os.path.join(_ensure_directories(), "state", name)
+
+
+def _read_token():
+    with open(_state_file("bridge-token"), "r", encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+def _read_endpoint():
+    """Discover the companion's port; the file carries no secret."""
+    try:
+        with open(_state_file("bridge-endpoint.json"), "r", encoding="utf-8") as handle:
+            endpoint = json.load(handle)
+        return endpoint.get("host", "127.0.0.1"), int(endpoint["port"])
+    except Exception:
+        return "127.0.0.1", DEFAULT_BRIDGE_PORT
+
+
+def _bridge_available():
+    return (plumbmate_bridge_client is not None and plumbmate_tick_driver is not None
+            and zone is not None and TICK_DRIVER is not None)
+
+
+def _hook_installed():
+    return bool(zone is not None and plumbmate_tick_driver is not None
+                and plumbmate_tick_driver.is_hooked(zone.Zone, "update"))
+
+
+@sims4.commands.Command("plumbmate.bridge.start", command_type=sims4.commands.CommandType.Live)
+def plumbmate_bridge_start(_connection=None):
+    """Bind a client and hook Zone.update so every tick pumps it."""
+    output = sims4.commands.CheatOutput(_connection)
+    if not _bridge_available():
+        output("PlumbMate: socket bridge unavailable in this build.")
+        return
+    try:
+        token = _read_token()
+    except Exception:
+        output("PlumbMate: no bridge token. Run 'plumbmate token' in the companion.")
+        return
+    host, port = _read_endpoint()
+    try:
+        previous = TICK_DRIVER.detach()
+        if previous is not None:
+            previous.close()
+        TICK_DRIVER.attach(plumbmate_bridge_client.BridgeClient(token, port, host=host))
+        # Zone.update(self, absolute_ticks); the wrapper runs the original first.
+        plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
+    except Exception as exc:
+        output("PlumbMate bridge start failed: {}".format(_safe_text(exc)))
+        return
+    output("PlumbMate bridge started: {}:{} | tick hook installed".format(host, port))
+
+
+@sims4.commands.Command("plumbmate.bridge.stop", command_type=sims4.commands.CommandType.Live)
+def plumbmate_bridge_stop(_connection=None):
+    output = sims4.commands.CheatOutput(_connection)
+    if not _bridge_available():
+        output("PlumbMate: socket bridge unavailable in this build.")
+        return
+    try:
+        plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update")
+        client = TICK_DRIVER.detach()
+        if client is not None:
+            client.close()
+    except Exception as exc:
+        output("PlumbMate bridge stop failed: {}".format(_safe_text(exc)))
+        return
+    output("PlumbMate bridge stopped; Zone.update restored.")
+
+
+@sims4.commands.Command("plumbmate.bridge.status", command_type=sims4.commands.CommandType.Live)
+def plumbmate_bridge_status(_connection=None):
+    output = sims4.commands.CheatOutput(_connection)
+    if not _bridge_available():
+        output("PlumbMate: socket bridge unavailable in this build.")
+        return
+    client = TICK_DRIVER.client
+    output("hook={} active={} driver={}".format(
+        _hook_installed(), TICK_DRIVER.active, TICK_DRIVER.stats))
+    if client is None:
+        output("No client bound. Run plumbmate.bridge.start.")
+        return
+    output("state={} queued={} awaiting_ack={} backoff={}s".format(
+        client.state, client.queued, client.awaiting_ack, client.backoff_seconds))
+    output("client={}".format(client.stats))
+    if client.last_error:
+        output("last_error={}".format(_safe_text(client.last_error)))
+    if TICK_DRIVER.disabled_reason:
+        output("driver disabled: {}".format(TICK_DRIVER.disabled_reason))
+
+
+@sims4.commands.Command("plumbmate.bridge.ping", command_type=sims4.commands.CommandType.Live)
+def plumbmate_bridge_ping(_connection=None):
+    """Queue one heartbeat. The tick hook does the sending."""
+    output = sims4.commands.CheatOutput(_connection)
+    if not _bridge_available() or TICK_DRIVER.client is None:
+        output("PlumbMate: no client bound. Run plumbmate.bridge.start.")
+        return
+    event_id = TICK_DRIVER.client.queue_event("heartbeat", {"source": "cheat_console"})
+    output("queued heartbeat: {}".format(event_id or "outbox full"))
+
+
 @sims4.commands.Command("plumbmate.status", command_type=sims4.commands.CommandType.Live)
 def plumbmate_status(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
     root = _ensure_directories()
     output("PlumbMate prototype 0.1 | bridge: {}".format(root))
+    output("socket bridge: {} | tick hook: {}".format(
+        "available" if _bridge_available() else "unavailable", _hook_installed()))
 
 
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)

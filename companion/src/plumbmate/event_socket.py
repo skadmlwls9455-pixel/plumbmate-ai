@@ -36,12 +36,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .protocol import PROTOCOL_VERSION, BridgePaths, ProtocolError
+from .protocol import PROTOCOL_VERSION, BridgePaths, ProtocolError, atomic_write_json
 
 
 LOOPBACK_HOST = "127.0.0.1"
 TOKEN_ENVIRONMENT_VARIABLE = "PLUMBMATE_BRIDGE_TOKEN"
 TOKEN_FILENAME = "bridge-token"
+ENDPOINT_FILENAME = "bridge-endpoint.json"
 
 MIN_TOKEN_CHARACTERS = 32
 NONCE_BYTES = 32
@@ -79,6 +80,30 @@ def generate_token() -> str:
 
 def token_path(paths: BridgePaths) -> Path:
     return paths.state / TOKEN_FILENAME
+
+
+def endpoint_path(paths: BridgePaths) -> Path:
+    return paths.state / ENDPOINT_FILENAME
+
+
+def write_endpoint(paths: BridgePaths, host: str, port: int) -> Path:
+    """Publish where the listener is, so the game side need not guess a port.
+
+    This is a convenience for discovery, never an authorization: a peer still
+    has to answer the challenge. The file carries no secret.
+    """
+    paths.ensure()
+    target = endpoint_path(paths)
+    atomic_write_json(target, {"host": host, "port": int(port),
+                               "protocol_version": PROTOCOL_VERSION})
+    return target
+
+
+def clear_endpoint(paths: BridgePaths) -> None:
+    try:
+        endpoint_path(paths).unlink()
+    except OSError:
+        pass
 
 
 def write_token(paths: BridgePaths, token: str | None = None) -> str:

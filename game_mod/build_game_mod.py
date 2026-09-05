@@ -54,6 +54,12 @@ def build(output: Path, game_app: Path = DEFAULT_GAME_APP, *, diagnostic: bool =
             (source_root / "plumbmate_mod" / "probe_core.py", Path("plumbmate_probe_core.pyc")),
             (source_root / "plumbmate_mod" / "ownership_probe.py", Path("plumbmate_ownership_probe.pyc")),
         ])
+    else:
+        # commands.py imports these by their published root-level names.
+        compile_units.extend([
+            (source_root / "plumbmate_mod" / "bridge_client.py", Path("plumbmate_bridge_client.pyc")),
+            (source_root / "plumbmate_mod" / "tick_driver.py", Path("plumbmate_tick_driver.pyc")),
+        ])
 
     library, base_zip, core_zip = _game_paths(game_app)
     expected_magic = _game_magic(core_zip)

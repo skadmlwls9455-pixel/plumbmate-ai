@@ -14,8 +14,10 @@ from .event_socket import (
     ALLOWED_EVENT_KINDS,
     BridgeClient,
     EventSocketServer,
+    clear_endpoint,
     load_token,
     token_path,
+    write_endpoint,
     write_token,
 )
 from .protocol import BridgePaths, PROTOCOL_VERSION, atomic_write_json, read_json
@@ -111,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "listen":
         # The socket layer is loopback-only and refuses to start without a token.
         with EventSocketServer(load_token(paths), port=args.port) as server:
+            write_endpoint(paths, "127.0.0.1", server.port)
             print(f"listening on 127.0.0.1:{server.port}", flush=True)
             seen = 0
             try:
@@ -125,6 +128,8 @@ def main(argv: list[str] | None = None) -> int:
                     }, ensure_ascii=False), flush=True)
             except KeyboardInterrupt:
                 pass
+            finally:
+                clear_endpoint(paths)
         return 0
     if args.command == "mock-event":
         payload = json.loads(args.payload)
