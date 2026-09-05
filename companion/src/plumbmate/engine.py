@@ -55,9 +55,14 @@ class CompanionEngine:
             try:
                 request = clamp_request(read_json(request_path))
                 validate_request(request)
-            except ProtocolError as exc:
-                # Deterministically invalid; retrying cannot change the answer.
-                self._quarantine(request_path, "rejected", str(exc))
+            except Exception as exc:
+                # Parsing, clamping, and validating are pure computation over
+                # the file's bytes: ANY failure here (ProtocolError, but also a
+                # TypeError from a wrong-typed field) is deterministic, and
+                # retrying cannot change the answer. Catching only ProtocolError
+                # would let a wrong-typed field bypass quarantine and pin the
+                # mtime-ordered queue forever.
+                self._quarantine(request_path, "rejected", f"{type(exc).__name__}: {exc}")
                 continue
             try:
                 # Session-state corruption counts as retryable too: it lands in
@@ -108,7 +113,13 @@ class CompanionEngine:
         session_path = self._session_path(str(request["session_id"]))
         previous: dict[str, Any] = {}
         if session_path.exists():
-            previous = read_json(session_path)
+            try:
+                previous = read_json(session_path)
+            except ProtocolError:
+                # A corrupt session file must not poison every future turn of
+                # that session; losing the compact memory and starting fresh
+                # is the recoverable outcome.
+                previous = {}
         prior_snapshot = previous.get("snapshot", {})
         prior_facts = [str(item)[:240] for item in previous.get("memory_facts", [])[-12:]]
         snapshot = {

@@ -30,6 +30,7 @@ import queue
 import secrets
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -200,6 +201,7 @@ class ServerStats:
     accepted_events: int = 0
     rejected_events: int = 0
     dropped_events: int = 0
+    acceptor_errors: int = 0
 
 
 def mock_event(
@@ -241,7 +243,14 @@ class _FrameStream:
         self._buffer = bytearray()
         self._max_bytes = max_bytes
 
-    def read_frame(self) -> dict[str, Any]:
+    def read_frame(self, deadline: float | None = None) -> dict[str, Any]:
+        """Read one frame; ``deadline`` (time.monotonic) bounds the WHOLE read.
+
+        A plain socket timeout is per-recv, so a peer trickling one byte per
+        interval could stretch a "5 second" handshake to hours while holding a
+        connection slot. With a deadline, every recv gets only the remaining
+        wall-clock budget.
+        """
         while True:
             index = self._buffer.find(b"\n")
             if index >= 0:
@@ -250,6 +259,11 @@ class _FrameStream:
                 return _decode_frame(raw)
             if len(self._buffer) > self._max_bytes:
                 raise ProtocolError("Frame exceeds the maximum size")
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Frame read deadline exceeded")
+                self._connection.settimeout(remaining)
             chunk = self._connection.recv(4096)
             if not chunk:
                 raise ConnectionError("Peer closed the connection")
@@ -343,6 +357,16 @@ class EventSocketServer:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stopping.set()
+        # Order matters: kill the acceptor FIRST, then sweep connections. The
+        # old order snapshotted connections before the acceptor died, so one
+        # accepted concurrently with stop() was never shut down and its worker
+        # could outlive stop() — and keep serving into a restarted server.
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            listener.close()
+        if self._acceptor is not None:
+            self._acceptor.join(timeout)
+            self._acceptor = None
         with self._lock:
             live = list(self._connections)
         for connection in live:
@@ -351,12 +375,6 @@ class EventSocketServer:
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        listener, self._listener = self._listener, None
-        if listener is not None:
-            listener.close()
-        if self._acceptor is not None:
-            self._acceptor.join(timeout)
-            self._acceptor = None
         for worker in list(self._workers):
             worker.join(timeout)
         self._workers.clear()
@@ -384,13 +402,25 @@ class EventSocketServer:
             events.append(event)
 
     def _accept_loop(self) -> None:
-        listener = self._listener
-        while not self._stopping.is_set() and listener is not None:
+        while not self._stopping.is_set():
+            listener = self._listener
+            if listener is None:
+                return
             try:
                 connection, address = listener.accept()
             except (socket.timeout, TimeoutError):
                 continue
             except OSError:
+                if self._stopping.is_set() or self._listener is None:
+                    return
+                # EMFILE/ECONNABORTED and friends are transient; dying here
+                # would leave a server that looks healthy but accepts nothing.
+                self._count("acceptor_errors")
+                time.sleep(_ACCEPT_POLL_SECONDS)
+                continue
+            if self._stopping.is_set():
+                # Accepted concurrently with stop(); nothing may serve it.
+                connection.close()
                 return
             if not _is_loopback(address[0]):
                 # Cannot happen through a loopback bind; refused anyway.
@@ -411,8 +441,18 @@ class EventSocketServer:
                 name="plumbmate-bridge",
                 daemon=True,
             )
+            try:
+                worker.start()
+            except Exception:
+                # Thread creation can fail under OS pressure; the slot and the
+                # connection must not leak with it, and the acceptor lives on.
+                with self._lock:
+                    self._connections.discard(connection)
+                connection.close()
+                self._slots.release()
+                self._count("acceptor_errors")
+                continue
             self._workers.append(worker)
-            worker.start()
 
     def _serve_connection(self, connection: socket.socket, peer: str) -> None:
         stream = _FrameStream(connection, self._max_frame_bytes)
@@ -422,7 +462,12 @@ class EventSocketServer:
             stream.write_frame({
                 "protocol_version": PROTOCOL_VERSION, "kind": "challenge", "nonce": nonce,
             })
-            if not self._authenticate(stream.read_frame(), nonce):
+            # The deadline bounds the whole unauthenticated read, not each
+            # recv, so a byte-trickling peer cannot pin a connection slot.
+            hello = stream.read_frame(
+                deadline=time.monotonic() + self._handshake_timeout,
+            )
+            if not self._authenticate(hello, nonce):
                 self._count("failed_handshakes")
                 stream.write_frame({
                     "protocol_version": PROTOCOL_VERSION,
@@ -434,8 +479,10 @@ class EventSocketServer:
             self._event_loop(stream, peer)
         except ProtocolError as exc:
             self._reply_error(stream, str(exc))
-        except (OSError, ConnectionError, ValueError):
-            # A disconnect or malformed peer ends this connection and nothing else.
+        except Exception:
+            # A disconnect, timeout, or malformed peer — however it surfaces —
+            # ends this connection and nothing else; the finally below still
+            # releases the slot, which matters more than the exception type.
             pass
         finally:
             with self._lock:

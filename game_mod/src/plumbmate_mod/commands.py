@@ -60,9 +60,20 @@ _BOUND_ENDPOINT = None
 AUTOSTART_STATE = "not_attempted"
 
 
+def _archive_marker(source_path):
+    """Index of the case-insensitive archive suffix, computed WITHOUT lowering
+    the whole path first: str.lower() can change string length (Turkish
+    U+0130), which would shift the index and slice the wrong prefix."""
+    width = len(ARCHIVE_SUFFIX)
+    for index in range(len(source_path) - width + 1):
+        if source_path[index:index + width].lower() == ARCHIVE_SUFFIX:
+            return index
+    return -1
+
+
 def _mod_directory():
     source_path = os.path.abspath(__file__)
-    marker = source_path.lower().find(ARCHIVE_SUFFIX)
+    marker = _archive_marker(source_path)
     if marker >= 0:
         archive_path = source_path[: marker + len(ARCHIVE_SUFFIX)]
         return os.path.dirname(archive_path)
@@ -99,7 +110,11 @@ def _sim_name(sim_info):
 
 
 def _active_sim(connection):
-    client = services.client_manager().get(connection)
+    """None on any lookup failure; a cheat command must answer, not traceback."""
+    try:
+        client = services.client_manager().get(connection)
+    except Exception:
+        return None
     return getattr(client, "active_sim", None) if client is not None else None
 
 
@@ -335,6 +350,9 @@ def plumbmate_bridge_start(_connection=None):
             previous.close()
         TICK_DRIVER.attach(client)
         _BOUND_ENDPOINT = endpoint
+        # stop() disarms the binder; a manual start re-arms it so port moves
+        # are followed again without restarting the game.
+        TICK_DRIVER.set_binder(_autostart_binder)
         # Zone.update(self, absolute_ticks); the wrapper runs the original first.
         plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
     except Exception as exc:
@@ -352,7 +370,11 @@ def plumbmate_bridge_stop(_connection=None):
         output("PlumbMate: socket bridge unavailable in this build.")
         return
     try:
-        plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update")
+        restored = plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update")
+        # The binder must go too: with another mod's wrapper stacked on top,
+        # the hook cannot be removed and ticks keep arriving — an armed binder
+        # would silently reconnect within seconds of this "stop".
+        TICK_DRIVER.set_binder(None)
         client = TICK_DRIVER.detach()
         if client is not None:
             client.close()
@@ -361,8 +383,13 @@ def plumbmate_bridge_stop(_connection=None):
     except Exception as exc:
         output("PlumbMate bridge stop failed: {}".format(_safe_text(exc)))
         return
-    output("PlumbMate bridge stopped; Zone.update restored. "
-           "Autostart resumes on the next game start.")
+    if restored:
+        output("PlumbMate bridge stopped; Zone.update restored. "
+               "Run plumbmate.bridge.start to resume, or restart the game.")
+    else:
+        output("PlumbMate bridge stopped. Another mod's wrapper sits on top of "
+               "Zone.update, so PlumbMate's hook was disabled in place instead "
+               "of removed. Run plumbmate.bridge.start to resume.")
 
 
 @sims4.commands.Command("plumbmate.bridge.status", command_type=sims4.commands.CommandType.Live)
@@ -414,8 +441,13 @@ def plumbmate_status(_connection=None):
 
 
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)
-def plumbmate_chat(message: str = "", _connection=None):
+def plumbmate_chat(*message_parts, _connection=None):
+    # The cheat console tokenizes on whitespace and passes every token as a
+    # positional argument; a single `message` parameter would receive only the
+    # first word and the second would collide with _connection. Every word of
+    # the player's message arrives here and is joined back together.
     output = sims4.commands.CheatOutput(_connection)
+    message = " ".join(_safe_text(part) for part in message_parts)
     sim = _active_sim(_connection)
     if sim is None:
         output("PlumbMate: active Sim not found. Load a household first.")

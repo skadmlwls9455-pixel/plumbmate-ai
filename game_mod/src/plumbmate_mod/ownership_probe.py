@@ -27,9 +27,19 @@ ACTIVE = None
 LISTENER = None
 
 
+def _archive_marker(source):
+    # lower()ing the whole path can change its length (Turkish U+0130) and
+    # shift the index; compare fixed-width slices instead.
+    suffix = ".ts4script"
+    for index in range(len(source) - len(suffix) + 1):
+        if source[index:index + len(suffix)].lower() == suffix:
+            return index
+    return -1
+
+
 def _root():
     source = os.path.abspath(__file__)
-    marker = source.lower().find(".ts4script")
+    marker = _archive_marker(source)
     if marker < 0:
         raise RuntimeError("Not running from the diagnostic archive")
     return os.path.join(os.path.dirname(source[:marker + len(".ts4script")]), "PlumbMateDiagnostics")

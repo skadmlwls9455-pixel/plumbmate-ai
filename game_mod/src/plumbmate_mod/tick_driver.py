@@ -35,6 +35,13 @@ DEFAULT_BIND_INTERVAL_SECONDS = 5.0
 
 HOOK_MARKER = "_plumbmate_tick_hook"
 ORIGINAL_MARKER = "_plumbmate_original"
+DRIVER_MARKER = "_plumbmate_driver_ref"
+
+# Wrappers THIS module load actually installed, by (class, method). Marker
+# attributes alone cannot prove ownership: functools.wraps in another mod
+# copies them onto that mod's wrapper, and a reloaded PlumbMate sees the
+# previous load's wrapper carrying markers it did not set.
+_INSTALLED_WRAPPERS = {}
 
 
 class TickDriver(object):
@@ -161,8 +168,10 @@ def is_hooked(target_class, method_name="update"):
 def install_tick_hook(target_class, driver, method_name="update"):
     """Wrap ``method_name`` so the driver ticks after the original returns.
 
-    Idempotent: a second call on an already hooked class changes nothing and
-    returns False, so a reloaded mod cannot stack wrappers.
+    Idempotent: a second call on an already hooked class installs no new
+    wrapper and returns False — but it REBINDS the surviving wrapper to the
+    given driver, so a reloaded mod's fresh driver actually receives ticks
+    instead of the invisible first-load driver keeping them forever.
     """
     original = getattr(target_class, method_name, None)
     if original is None:
@@ -170,25 +179,59 @@ def install_tick_hook(target_class, driver, method_name="update"):
             "{} has no method {}".format(getattr(target_class, "__name__", target_class), method_name)
         )
     if getattr(original, HOOK_MARKER, False):
+        holder = getattr(original, DRIVER_MARKER, None)
+        if holder is not None:
+            holder[0] = driver
         return False
+
+    holder = [driver]
 
     def plumbmate_tick_wrapper(self, *args, **kwargs):
         # Gameplay first. A failure in the original must not be hidden by ours.
         result = original(self, *args, **kwargs)
-        driver.on_tick(args[0] if args else None)
+        active = holder[0]
+        if active is not None:
+            active.on_tick(args[0] if args else None)
         return result
 
     setattr(plumbmate_tick_wrapper, HOOK_MARKER, True)
     setattr(plumbmate_tick_wrapper, ORIGINAL_MARKER, original)
+    setattr(plumbmate_tick_wrapper, DRIVER_MARKER, holder)
     plumbmate_tick_wrapper.__name__ = getattr(original, "__name__", method_name)
     setattr(target_class, method_name, plumbmate_tick_wrapper)
+    _INSTALLED_WRAPPERS[(target_class, method_name)] = plumbmate_tick_wrapper
     return True
 
 
 def remove_tick_hook(target_class, method_name="update"):
-    """Restore the original method. Returns False when nothing was hooked."""
+    """Restore the original method, or disable the hook in place.
+
+    Returns True only when the chain was actually restored. When something
+    else wrapped Zone.update on top of us (the normal TS4 injection pattern),
+    or a functools.wraps copy carries our markers, or the wrapper belongs to
+    a previous module load, unwinding the chain would rip out other mods'
+    hooks — so instead the PlumbMate layer is deactivated where it stands
+    (its driver reference is cleared) and False is returned. Either way,
+    after this call no PlumbMate driver receives ticks until a new install.
+    """
     current = getattr(target_class, method_name, None)
-    if not getattr(current, HOOK_MARKER, False):
-        return False
-    setattr(target_class, method_name, getattr(current, ORIGINAL_MARKER))
-    return True
+    ours = _INSTALLED_WRAPPERS.get((target_class, method_name))
+    if current is not None and current is ours:
+        setattr(target_class, method_name, getattr(current, ORIGINAL_MARKER))
+        holder = getattr(current, DRIVER_MARKER, None)
+        if holder is not None:
+            holder[0] = None
+        _INSTALLED_WRAPPERS.pop((target_class, method_name), None)
+        return True
+    # Deactivate in place: the holder is shared even by wraps-copies, so
+    # clearing it silences our layer without touching anyone else's chain.
+    if current is not None:
+        holder = getattr(current, DRIVER_MARKER, None)
+        if holder is not None:
+            holder[0] = None
+    if ours is not None:
+        holder = getattr(ours, DRIVER_MARKER, None)
+        if holder is not None:
+            holder[0] = None
+        _INSTALLED_WRAPPERS.pop((target_class, method_name), None)
+    return False

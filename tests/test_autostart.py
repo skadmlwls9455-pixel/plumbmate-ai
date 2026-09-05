@@ -378,6 +378,102 @@ class AutostartTests(unittest.TestCase):
         self.assertEqual(received.event_id, event_id)
         self.assertEqual(received.payload, {"source": "queued-offline"})
 
+    def test_chat_accepts_multiword_messages_positionally(self):
+        # The real cheat console splits on whitespace and passes each token
+        # positionally; a single `message` parameter only ever worked for
+        # one-word messages on the actual engine.
+        module = self.boot()
+        module.plumbmate_chat("can", "we", "go", "fishing")
+        transcript = "\n".join(sys.modules["sims4.commands"].CheatOutput.transcript)
+        self.assertNotIn("TypeError", transcript)
+        self.assertIn("active Sim not found", transcript)
+
+    def test_archive_marker_survives_length_changing_lowercase(self):
+        module = self.boot()
+        path = "/Mods/İndirilenler/PlumbMate.ts4script/plumbmate_boot.py"
+        marker = module._archive_marker(path)
+        self.assertGreater(marker, 0)
+        sliced = path[: marker + len(module.ARCHIVE_SUFFIX)]
+        self.assertTrue(sliced.endswith(".ts4script"), sliced)
+
+    def test_stop_holds_even_under_a_foreign_wrapper_on_top(self):
+        # Other mods routinely wrap Zone.update over ours (often with
+        # functools.wraps, which copies our marker attributes). stop must
+        # still actually stop: no reconnect, no chain surgery on their hook.
+        import functools
+
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        self.write_token()
+        self.write_endpoint(server.port)
+        module = self.boot()
+        zone = self.zone_class()
+        self.assertTrue(self.tick_until(
+            zone, lambda: module.TICK_DRIVER.client is not None
+            and module.TICK_DRIVER.client.connected
+        ))
+        connections_before = server.stats.accepted_connections
+
+        ours = self.zone_class.update
+
+        @functools.wraps(ours)
+        def foreign_wrapper(self, absolute_ticks):
+            return ours(self, absolute_ticks)
+
+        self.zone_class.update = foreign_wrapper
+
+        module.plumbmate_bridge_stop()
+        transcript = "\n".join(sys.modules["sims4.commands"].CheatOutput.transcript)
+        self.assertIn("disabled in place", transcript)
+        # The foreign wrapper must remain exactly where it was.
+        self.assertIs(self.zone_class.update, foreign_wrapper)
+
+        for tick in range(200):
+            zone.update(tick)
+            time.sleep(0.002)
+        self.assertIsNone(module.TICK_DRIVER.client)
+        self.assertEqual(module.AUTOSTART_STATE, "stopped_by_command")
+        self.assertEqual(server.stats.accepted_connections, connections_before,
+                         "stopped bridge reconnected on its own")
+
+    def test_reloaded_module_receives_ticks_through_the_surviving_wrapper(self):
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        self.write_token()
+        self.write_endpoint(server.port)
+        first = self.boot()
+        zone = self.zone_class()
+        self.assertTrue(self.tick_until(
+            zone, lambda: first.TICK_DRIVER.client is not None
+            and first.TICK_DRIVER.client.connected
+        ))
+
+        # A script reload executes the boot module again: fresh TICK_DRIVER,
+        # same already-hooked Zone class. The surviving wrapper must drive the
+        # NEW driver, not keep ticking the invisible old one.
+        second = self.boot()
+        self.assertIsNot(second.TICK_DRIVER, first.TICK_DRIVER)
+        self.assertTrue(self.tick_until(
+            zone, lambda: second.TICK_DRIVER.client is not None
+            and second.TICK_DRIVER.client.connected,
+            timeout=25.0,
+        ), "reloaded module's driver never received ticks")
+        event_id = second.TICK_DRIVER.client.queue_event("heartbeat", {"source": "reload"})
+        self.assertTrue(self.tick_until(
+            zone, lambda: second.TICK_DRIVER.client.stats["acked_events"] == 1
+        ))
+        received = None
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            event = server.poll(timeout=1.0)
+            if event is not None and event.payload == {"source": "reload"}:
+                received = event
+                break
+        self.assertIsNotNone(received)
+        self.assertEqual(received.event_id, event_id)
+
     def test_stop_command_unhooks_and_leaves_the_engine_alone(self):
         server = EventSocketServer(TOKEN, idle_timeout=60.0)
         server.start()

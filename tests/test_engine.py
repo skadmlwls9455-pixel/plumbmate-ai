@@ -150,6 +150,56 @@ class EngineTests(unittest.TestCase):
         )
 
 
+class QuarantineBreadthTests(unittest.TestCase):
+    """Deterministic input failures of ANY exception type must quarantine."""
+
+    def setUp(self):
+        temporary = tempfile.mkdtemp(prefix="plumbmate-engine-q-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(temporary, True))
+        self.paths = BridgePaths(Path(temporary))
+        self.paths.ensure()
+
+    def test_wrong_typed_field_is_quarantined_not_looping(self):
+        # household: 42 raises TypeError inside clamp_request — before the
+        # fix that bypassed the ProtocolError-only catch and the mtime-ordered
+        # queue retried the same file forever, starving everything behind it.
+        engine = CompanionEngine(self.paths, MockProvider())
+        broken = valid_request()
+        broken["household"] = 42
+        target = self.paths.requests / "{}.json".format(broken["request_id"])
+        atomic_write_json(target, broken)
+        os.utime(str(target), (os.path.getmtime(str(target)) - 60,) * 2)
+        healthy = valid_request()
+        atomic_write_json(self.paths.requests / "{}.json".format(healthy["request_id"]), healthy)
+        result = engine.process_one()
+        self.assertIsNotNone(result, "the healthy request behind the poison never ran")
+        self.assertTrue(
+            (self.paths.archive / "{}.rejected.json".format(broken["request_id"])).exists()
+        )
+
+    def test_path_traversal_request_id_is_rejected(self):
+        from plumbmate.protocol import ProtocolError, validate_request
+        for hostile in ("../../evil", "a/b", "a\\b", "", "x" * 65, 7):
+            request = valid_request()
+            request["request_id"] = hostile
+            with self.assertRaises(ProtocolError, msg=repr(hostile)):
+                validate_request(request)
+
+    def test_corrupt_session_file_resets_instead_of_poisoning_the_session(self):
+        engine = CompanionEngine(self.paths, MockProvider())
+        request = valid_request(session_id="corrupt-session")
+        session_path = engine._session_path("corrupt-session")
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text("{broken json", encoding="utf-8")
+        atomic_write_json(self.paths.requests / "{}.json".format(request["request_id"]), request)
+        result = engine.process_one()
+        self.assertIsNotNone(result, "a corrupt session file blocked the turn")
+        # The session file is rewritten cleanly for the next turn.
+        import json as json_module
+        rewritten = json_module.loads(session_path.read_text(encoding="utf-8"))
+        self.assertIn("memory_facts", rewritten)
+
+
 class TrustBoundaryTests(unittest.TestCase):
     """Bounds that hold even for hand-edited bridge files and hostile saves."""
 

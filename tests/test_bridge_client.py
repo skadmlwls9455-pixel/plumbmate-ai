@@ -56,7 +56,13 @@ class ConstructionTests(unittest.TestCase):
             bridge.BridgeClient("a" * (MIN_TOKEN_CHARACTERS - 1), 1)
 
     def test_non_loopback_host_is_refused(self):
-        for host in ("0.0.0.0", "192.168.1.10", "example.invalid", "", "::1", "127.0.0"):
+        # '١٢٧.0.0.1' uses Arabic-Indic digits: isdigit()/int() accept them,
+        # but the socket layer would IDNA-encode the host and do a blocking
+        # DNS lookup on the engine thread — exactly what this guard forbids.
+        for host in (
+            "0.0.0.0", "192.168.1.10", "example.invalid", "", "::1", "127.0.0",
+            "١٢٧.0.0.1",
+        ):
             with self.subTest(host=host):
                 with self.assertRaises(ValueError):
                     bridge.BridgeClient(TOKEN, 1, host=host)

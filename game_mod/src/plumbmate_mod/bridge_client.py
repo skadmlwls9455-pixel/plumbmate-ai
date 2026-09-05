@@ -95,9 +95,16 @@ _ALREADY_CONNECTED = _errno_set("EISCONN", "WSAEISCONN")
 
 
 def _is_loopback(host):
-    """Accept only a literal 127.0.0.0/8 address; this client is AF_INET."""
+    """Accept only a literal ASCII 127.0.0.0/8 address; this client is AF_INET.
+
+    ASCII matters: isdigit()/int() also accept Unicode digits (e.g. Arabic-
+    Indic), and such a host is NOT numeric to the socket layer — connect would
+    IDNA-encode it and do a blocking DNS lookup on the engine thread.
+    """
     parts = host.split(".") if isinstance(host, str) else []
-    if len(parts) != 4 or not all(part.isdigit() and len(part) <= 3 for part in parts):
+    if len(parts) != 4 or not all(
+        part.isascii() and part.isdigit() and len(part) <= 3 for part in parts
+    ):
         return False
     octets = [int(part) for part in parts]
     return octets[0] == 127 and all(0 <= octet <= 255 for octet in octets)

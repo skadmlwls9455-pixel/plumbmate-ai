@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 
 PROTOCOL_VERSION = "0.1"
+
+# request_id becomes part of a response filename, so it must never carry path
+# separators or anything else that could steer the write outside responses/.
+_REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
 
 
 class ProtocolError(ValueError):
@@ -68,6 +73,11 @@ def validate_request(value: dict[str, Any]) -> None:
         raise ProtocolError("Missing request fields: " + ", ".join(missing))
     if value["protocol_version"] != PROTOCOL_VERSION or value["kind"] != "turn":
         raise ProtocolError("Unsupported request protocol or kind")
+    request_id = value["request_id"]
+    if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+        raise ProtocolError(
+            "Request request_id must be 1-64 characters of [A-Za-z0-9_-]"
+        )
     if not isinstance(value["actor"], dict) or "name" not in value["actor"]:
         raise ProtocolError("Request actor is invalid")
 
