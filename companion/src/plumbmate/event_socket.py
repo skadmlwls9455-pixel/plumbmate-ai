@@ -44,6 +44,11 @@ TOKEN_ENVIRONMENT_VARIABLE = "PLUMBMATE_BRIDGE_TOKEN"
 TOKEN_FILENAME = "bridge-token"
 ENDPOINT_FILENAME = "bridge-endpoint.json"
 
+# Cadence advertised inside the endpoint file and honoured by refresh_endpoint.
+# The game side treats a file aged far past its own cadence as a companion that
+# died without cleanup; files without the field are never aged out.
+ENDPOINT_REFRESH_SECONDS = 5.0
+
 MIN_TOKEN_CHARACTERS = 32
 NONCE_BYTES = 32
 MAX_FRAME_BYTES = 64 * 1024
@@ -95,8 +100,19 @@ def write_endpoint(paths: BridgePaths, host: str, port: int) -> Path:
     paths.ensure()
     target = endpoint_path(paths)
     atomic_write_json(target, {"host": host, "port": int(port),
-                               "protocol_version": PROTOCOL_VERSION})
+                               "protocol_version": PROTOCOL_VERSION,
+                               "refresh_seconds": ENDPOINT_REFRESH_SECONDS})
     return target
+
+
+def refresh_endpoint(paths: BridgePaths) -> None:
+    """Touch the endpoint file so a reader can tell a live companion from a
+    crashed one. Failure is harmless: the reader then ages the file out and
+    the next write_endpoint recreates it."""
+    try:
+        os.utime(endpoint_path(paths))
+    except OSError:
+        pass
 
 
 def clear_endpoint(paths: BridgePaths) -> None:

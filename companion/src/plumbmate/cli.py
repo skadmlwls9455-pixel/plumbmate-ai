@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -12,10 +13,12 @@ from pathlib import Path
 from .engine import CompanionEngine
 from .event_socket import (
     ALLOWED_EVENT_KINDS,
+    ENDPOINT_REFRESH_SECONDS,
     BridgeClient,
     EventSocketServer,
     clear_endpoint,
     load_token,
+    refresh_endpoint,
     token_path,
     write_endpoint,
     write_token,
@@ -93,11 +96,31 @@ def main(argv: list[str] | None = None) -> int:
         engine = CompanionEngine(paths, create_provider(args.provider))
         if args.command == "serve-once":
             result = engine.process_one()
+            for notice in engine.drain_notices():
+                print(f"quarantined {notice}", file=sys.stderr, flush=True)
             print(result if result else "no pending request")
             return 0
+        # The loop must survive any single request: the engine quarantines
+        # deterministic failures itself, and transient provider errors are
+        # retried here with a capped exponential backoff instead of dying.
+        consecutive_failures = 0
         try:
             while True:
-                result = engine.process_one()
+                try:
+                    result = engine.process_one()
+                except Exception as exc:
+                    consecutive_failures += 1
+                    delay = min(30.0, max(0.5, args.interval) * (2 ** min(consecutive_failures, 6)))
+                    print(
+                        f"provider error ({consecutive_failures} in a row): {exc}; "
+                        f"retrying in {delay:.1f}s",
+                        file=sys.stderr, flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                consecutive_failures = 0
+                for notice in engine.drain_notices():
+                    print(f"quarantined {notice}", file=sys.stderr, flush=True)
                 if result:
                     print(result, flush=True)
                 else:
@@ -116,8 +139,14 @@ def main(argv: list[str] | None = None) -> int:
             write_endpoint(paths, "127.0.0.1", server.port)
             print(f"listening on 127.0.0.1:{server.port}", flush=True)
             seen = 0
+            next_refresh = time.monotonic() + ENDPOINT_REFRESH_SECONDS
             try:
                 while args.events <= 0 or seen < args.events:
+                    # Touching the endpoint file marks this companion as alive,
+                    # so the game side can age out a file left by a crash.
+                    if time.monotonic() >= next_refresh:
+                        refresh_endpoint(paths)
+                        next_refresh = time.monotonic() + ENDPOINT_REFRESH_SECONDS
                     event = server.poll(timeout=0.5)
                     if event is None:
                         continue

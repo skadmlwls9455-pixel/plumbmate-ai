@@ -10,6 +10,7 @@ from typing import Any
 from .budget import clamp_request, state_delta
 from .protocol import (
     BridgePaths,
+    ProtocolError,
     atomic_write_json,
     pending_requests,
     read_json,
@@ -20,25 +21,74 @@ from .providers import Provider
 
 
 class CompanionEngine:
-    def __init__(self, paths: BridgePaths, provider: Provider) -> None:
+    """Processes requests one at a time; a bad request must never wedge the rest.
+
+    A request the protocol itself rejects is quarantined immediately: it can
+    only fail the same way again. A provider failure (network, HTTP, malformed
+    model output) is retried — the exception propagates so the caller decides
+    the pacing — and after ``max_attempts`` the request is quarantined too, so
+    one poisonous file cannot pin the queue forever. Quarantined requests move
+    to the archive with a suffixed name plus a ``.reason.txt`` sidecar, and the
+    move is announced through :meth:`drain_notices`.
+    """
+
+    def __init__(
+        self, paths: BridgePaths, provider: Provider, *, max_attempts: int = 5,
+    ) -> None:
         self.paths = paths
         self.provider = provider
         self.paths.ensure()
+        self._max_attempts = max(1, int(max_attempts))
+        self._attempts: dict[str, int] = {}
+        self._notices: list[str] = []
+
+    def drain_notices(self) -> list[str]:
+        """Return and clear quarantine announcements for the caller to log."""
+        notices, self._notices = self._notices, []
+        return notices
 
     def process_one(self) -> Path | None:
-        request_path = next(iter(pending_requests(self.paths)), None)
-        if request_path is None:
-            return None
-        request = clamp_request(read_json(request_path))
-        validate_request(request)
-        model_request, snapshot, prior_facts = self._prepare_request(request)
-        response = self.provider.respond(model_request)
-        validate_response(response)
-        response_path = self.paths.responses / f"{request['request_id']}.json"
-        atomic_write_json(response_path, response)
-        self._save_session(request["session_id"], snapshot, prior_facts, response)
-        shutil.move(str(request_path), str(self.paths.archive / request_path.name))
-        return response_path
+        while True:
+            request_path = next(iter(pending_requests(self.paths)), None)
+            if request_path is None:
+                return None
+            try:
+                request = clamp_request(read_json(request_path))
+                validate_request(request)
+            except ProtocolError as exc:
+                # Deterministically invalid; retrying cannot change the answer.
+                self._quarantine(request_path, "rejected", str(exc))
+                continue
+            try:
+                # Session-state corruption counts as retryable too: it lands in
+                # quarantine after max_attempts instead of looping forever.
+                model_request, snapshot, prior_facts = self._prepare_request(request)
+                response = self.provider.respond(model_request)
+                validate_response(response)
+            except Exception as exc:
+                attempts = self._attempts.get(request_path.name, 0) + 1
+                self._attempts[request_path.name] = attempts
+                if attempts >= self._max_attempts:
+                    self._attempts.pop(request_path.name, None)
+                    self._quarantine(
+                        request_path, "failed",
+                        f"{type(exc).__name__}: {exc} (after {attempts} attempts)",
+                    )
+                    continue
+                raise
+            self._attempts.pop(request_path.name, None)
+            response_path = self.paths.responses / f"{request['request_id']}.json"
+            atomic_write_json(response_path, response)
+            self._save_session(request["session_id"], snapshot, prior_facts, response)
+            shutil.move(str(request_path), str(self.paths.archive / request_path.name))
+            return response_path
+
+    def _quarantine(self, request_path: Path, kind: str, detail: str) -> None:
+        target = self.paths.archive / f"{request_path.stem}.{kind}.json"
+        shutil.move(str(request_path), str(target))
+        reason_path = target.with_suffix(".reason.txt")
+        reason_path.write_text(detail + "\n", encoding="utf-8")
+        self._notices.append(f"{kind}: {request_path.name}: {detail}")
 
     def process_all(self) -> list[Path]:
         completed: list[Path] = []
