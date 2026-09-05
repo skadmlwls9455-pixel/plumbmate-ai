@@ -35,6 +35,23 @@ actions yet.
 The current game-side adapter reports only a safe, small identity/household
 snapshot. Action execution is intentionally disabled in this first milestone.
 
+## Event socket
+
+Alongside the file bridge, the mod opens a loopback socket to the companion so
+the game can push events as they happen. It needs no cheat command: the mod
+hooks `Zone.update` when it loads and connects on its own once `plumbmate
+listen` is running, following the companion to a new port if it restarts.
+Until then the hook is idle and connects to nothing.
+
+- `plumbmate.status` — whether the bridge is available, hooked, and connected.
+- `plumbmate.bridge.status` — connection state, counters, and last error.
+- `plumbmate.bridge.stop` — unhook for the rest of the session.
+- To keep autostart off from the start, create an empty file named
+  `autostart-disabled` in `PlumbMateBridge/state/`.
+
+The socket is loopback-only and authenticated per connection with an HMAC
+answer to the server's nonce; the token itself is never sent.
+
 ## Repository layout
 
 ```text

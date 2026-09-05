@@ -200,6 +200,124 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.zone.seen, [3])
 
 
+class FakeClock(object):
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class BinderTests(unittest.TestCase):
+    """The binder is what lets the hook be installed before anything listens."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+
+    def driver(self, binder, interval=5.0):
+        return driver_module.TickDriver(
+            binder=binder, bind_interval_seconds=interval, now=self.clock,
+        )
+
+    def test_driver_stays_idle_while_the_binder_supplies_nothing(self):
+        driver = self.driver(lambda current: None)
+        for tick in range(100):
+            self.clock.advance(1.0)
+            self.assertFalse(driver.on_tick(tick))
+        self.assertIsNone(driver.client)
+        self.assertFalse(driver.active)
+        self.assertEqual(driver.stats["pumps"], 0)
+        self.assertEqual(driver.stats["binds"], 0)
+
+    def test_a_late_client_is_picked_up_and_pumped(self):
+        supply = []
+
+        def binder(current):
+            return supply[0] if supply else None
+
+        driver = self.driver(binder)
+        self.clock.advance(10.0)
+        driver.on_tick(0)
+        self.assertIsNone(driver.client)
+        client = RecordingClient()
+        supply.append(client)
+        self.clock.advance(10.0)
+        self.assertTrue(driver.on_tick(1))
+        self.assertIs(driver.client, client)
+        self.assertEqual(client.pumps, 1)
+        self.assertEqual(driver.stats["binds"], 1)
+
+    def test_binder_is_throttled_by_time_not_by_ticks(self):
+        calls = []
+
+        def binder(current):
+            calls.append(self.clock.value)
+            return None
+
+        driver = self.driver(binder, interval=5.0)
+        for _ in range(1000):
+            self.clock.advance(0.001)
+            driver.on_tick(0)
+        self.assertEqual(len(calls), 1)
+        self.clock.advance(5.0)
+        driver.on_tick(0)
+        self.assertEqual(len(calls), 2)
+
+    def test_binder_sees_the_current_client_and_can_replace_it(self):
+        first, second = RecordingClient(), RecordingClient()
+        seen = []
+
+        def binder(current):
+            seen.append(current)
+            return second if current is first else first
+
+        driver = self.driver(binder)
+        driver.on_tick(0)
+        self.assertIs(driver.client, first)
+        self.clock.advance(10.0)
+        driver.on_tick(1)
+        self.assertIs(driver.client, second)
+        self.assertEqual(seen, [None, first])
+
+    def test_returning_the_same_client_is_not_counted_as_a_rebind(self):
+        client = RecordingClient()
+        driver = self.driver(lambda current: client)
+        driver.on_tick(0)
+        self.clock.advance(10.0)
+        driver.on_tick(1)
+        self.assertEqual(driver.stats["binds"], 1)
+        self.assertEqual(client.pumps, 2)
+
+    def test_an_exploding_binder_never_reaches_the_engine(self):
+        def binder(current):
+            raise RuntimeError("companion state is unreadable")
+
+        driver = self.driver(binder)
+        driver_module.install_tick_hook(FakeZone, driver, "update")
+        self.addCleanup(driver_module.remove_tick_hook, FakeZone, "update")
+        zone = FakeZone()
+        self.clock.advance(10.0)
+        self.assertEqual(zone.update(7), "engine-result")
+        self.assertEqual(driver.stats["bind_errors"], 1)
+        self.assertIn("companion state is unreadable", driver.last_bind_error)
+
+    def test_a_rebind_revives_a_driver_disabled_by_pump_failures(self):
+        supply = [ExplodingClient()]
+        driver = self.driver(lambda current: supply[0] if supply[0] is not current else None)
+        driver.on_tick(0)
+        for tick in range(driver_module.DEFAULT_MAX_CONSECUTIVE_ERRORS):
+            driver.on_tick(tick)
+        self.assertIsNotNone(driver.disabled_reason)
+        supply[0] = RecordingClient()
+        self.clock.advance(10.0)
+        self.assertTrue(driver.on_tick(99))
+        self.assertIsNone(driver.disabled_reason)
+        self.assertTrue(driver.active)
+
+
 class TickedInteropTests(unittest.TestCase):
     """Fake Zone ticks a real client against the real companion server."""
 

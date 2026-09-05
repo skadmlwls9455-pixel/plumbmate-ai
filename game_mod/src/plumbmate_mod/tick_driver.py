@@ -17,11 +17,21 @@ tick budget forever; a console command can re-enable it.
 cost. Nothing here measures the game's actual tick budget, and no test in this
 repository can; the default of 1 pumps on every tick as configured, and the
 knob is the honest place to back that off if a profile ever says to.
+
+An optional ``binder`` lets the driver acquire its own client instead of
+waiting for someone to call ``attach``. It is what makes a hands-off start
+possible: the hook can be installed while nothing is listening yet, and the
+driver stays idle until the binder hands it a client. The binder receives the
+currently bound client so it can decide to replace it, and its throttle is in
+seconds rather than ticks because this module has no idea how fast a tick is.
 """
+
+import time
 
 
 DEFAULT_EVERY_N_TICKS = 1
 DEFAULT_MAX_CONSECUTIVE_ERRORS = 8
+DEFAULT_BIND_INTERVAL_SECONDS = 5.0
 
 HOOK_MARKER = "_plumbmate_tick_hook"
 ORIGINAL_MARKER = "_plumbmate_original"
@@ -35,18 +45,29 @@ class TickDriver(object):
         client=None,
         every_n_ticks=DEFAULT_EVERY_N_TICKS,
         max_consecutive_errors=DEFAULT_MAX_CONSECUTIVE_ERRORS,
+        binder=None,
+        bind_interval_seconds=DEFAULT_BIND_INTERVAL_SECONDS,
+        now=None,
     ):
         if int(every_n_ticks) < 1:
             raise ValueError("every_n_ticks must be at least 1")
         self._client = client
         self._every = int(every_n_ticks)
         self._max_consecutive_errors = int(max_consecutive_errors)
+        self._binder = binder
+        self._bind_interval = float(bind_interval_seconds)
+        self._now = now or time.monotonic
+        self._next_bind_at = 0.0
         self._counter = 0
         self._consecutive_errors = 0
         self.disabled_reason = None
         self.last_state = None
         self.last_error = None
-        self.stats = {"ticks": 0, "pumps": 0, "skipped": 0, "errors": 0, "disables": 0}
+        self.last_bind_error = None
+        self.stats = {
+            "ticks": 0, "pumps": 0, "skipped": 0, "errors": 0, "disables": 0,
+            "bind_attempts": 0, "binds": 0, "bind_errors": 0,
+        }
 
     @property
     def client(self):
@@ -75,9 +96,40 @@ class TickDriver(object):
         self.disabled_reason = None
         self._consecutive_errors = 0
 
+    def set_binder(self, binder, interval_seconds=None):
+        """Install or clear the callable that supplies a client."""
+        self._binder = binder
+        if interval_seconds is not None:
+            self._bind_interval = float(interval_seconds)
+        self._next_bind_at = 0.0
+        return self
+
+    def _try_bind(self):
+        """Ask the binder for a client. Swallows everything; runs on the engine."""
+        now = self._now()
+        if now < self._next_bind_at:
+            return False
+        self._next_bind_at = now + self._bind_interval
+        self.stats["bind_attempts"] += 1
+        try:
+            client = self._binder(self._client)
+        except BaseException as exc:
+            self.stats["bind_errors"] += 1
+            self.last_bind_error = "{}: {}".format(type(exc).__name__, exc)
+            return False
+        if client is None or client is self._client:
+            return False
+        # attach() also clears a disable, so a rebind revives a dead driver.
+        self.attach(client)
+        self.stats["binds"] += 1
+        self.last_bind_error = None
+        return True
+
     def on_tick(self, absolute_ticks=None):
         """Advance the client by at most one pump. Never raises, never blocks."""
         self.stats["ticks"] += 1
+        if self._binder is not None:
+            self._try_bind()
         if not self.active:
             self.stats["skipped"] += 1
             return False

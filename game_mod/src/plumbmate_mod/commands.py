@@ -1,4 +1,11 @@
-"""Python 3.7-compatible game commands for the filesystem bridge."""
+"""Python 3.7-compatible game commands for the filesystem bridge.
+
+This module is published as ``plumbmate_boot.pyc`` and the game imports it at
+mod load. Importing it installs the tick hook and starts binding the bridge on
+its own, so a normal session needs no cheat command at all. The manual
+``plumbmate.bridge.*`` commands stay, because they are how a session is
+inspected, stopped, or pointed somewhere by hand.
+"""
 
 import datetime
 import json
@@ -37,9 +44,15 @@ except Exception as _exc:
 PROTOCOL_VERSION = "0.1"
 ARCHIVE_SUFFIX = ".ts4script"
 DEFAULT_BRIDGE_PORT = 47651
+AUTOSTART_DISABLE_FILE = "autostart-disabled"
 
-# Initialized at import; idle until plumbmate.bridge.start binds a client.
+# Initialized at import; idle until a client is bound, by autostart or by hand.
 TICK_DRIVER = plumbmate_tick_driver.TickDriver() if plumbmate_tick_driver else None
+
+# The endpoint the bound client was built for, so the binder can tell a live
+# client from one aimed at a companion that has since restarted on a new port.
+_BOUND_ENDPOINT = None
+AUTOSTART_STATE = "not_attempted"
 
 
 def _mod_directory():
@@ -199,9 +212,92 @@ def _hook_installed():
                 and plumbmate_tick_driver.is_hooked(zone.Zone, "update"))
 
 
+def _live_endpoint():
+    """Return (host, port) only while the companion is publishing an endpoint.
+
+    ``plumbmate listen`` writes this file on start and deletes it on exit, and
+    it asks the kernel for a free port by default, so the file is both the
+    liveness signal and the only way to learn the current port. Its absence is
+    the ordinary case of "the companion is not running", not an error.
+    """
+    try:
+        with open(_state_file("bridge-endpoint.json"), "r", encoding="utf-8") as handle:
+            endpoint = json.load(handle)
+        return endpoint.get("host", "127.0.0.1"), int(endpoint["port"])
+    except Exception:
+        return None
+
+
+def _autostart_disabled():
+    """A file beside the token turns autostart off before the game loads."""
+    try:
+        return os.path.exists(_state_file(AUTOSTART_DISABLE_FILE))
+    except Exception:
+        return False
+
+
+def _autostart_binder(current):
+    """Supply the tick driver with a client. Returns None to change nothing.
+
+    Called from the tick hook on the engine thread every few seconds, so it
+    only stats a couple of files and builds a client when the endpoint it is
+    bound to is not the one the companion is currently publishing.
+    """
+    global _BOUND_ENDPOINT, AUTOSTART_STATE
+    endpoint = _live_endpoint()
+    if endpoint is None:
+        AUTOSTART_STATE = "waiting_for_companion"
+        return None
+    if current is not None and _BOUND_ENDPOINT == endpoint:
+        AUTOSTART_STATE = "bound"
+        return None
+    try:
+        token = _read_token()
+    except Exception:
+        AUTOSTART_STATE = "waiting_for_token"
+        return None
+    client = plumbmate_bridge_client.BridgeClient(token, endpoint[1], host=endpoint[0])
+    if current is not None:
+        # The endpoint moved; the old socket has nothing left to reach.
+        current.close()
+    _BOUND_ENDPOINT = endpoint
+    AUTOSTART_STATE = "bound"
+    return client
+
+
+def start_autostart():
+    """Hook Zone.update at mod load and let the binder connect when it can.
+
+    Installing the hook with nothing bound costs one wrapper call per tick and
+    connects to nothing; the driver stays idle until the companion appears.
+    Any failure here is reported through plumbmate.status rather than raised,
+    because an exception during mod import would take the whole mod down.
+    """
+    global AUTOSTART_STATE
+    if _autostart_disabled():
+        AUTOSTART_STATE = "disabled_by_file"
+        return False
+    available, reason = _bridge_reason()
+    if not available:
+        AUTOSTART_STATE = "unavailable: {}".format(reason)
+        return False
+    try:
+        TICK_DRIVER.set_binder(_autostart_binder)
+        plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
+    except Exception as exc:
+        AUTOSTART_STATE = "hook_failed: {}: {}".format(type(exc).__name__, exc)
+        return False
+    AUTOSTART_STATE = "waiting_for_companion"
+    return True
+
+
 @sims4.commands.Command("plumbmate.bridge.start", command_type=sims4.commands.CommandType.Live)
 def plumbmate_bridge_start(_connection=None):
-    """Bind a client and hook Zone.update so every tick pumps it."""
+    """Bind a client now and hook Zone.update so every tick pumps it.
+
+    Autostart normally does this at mod load; this stays for a forced rebind.
+    """
+    global _BOUND_ENDPOINT
     output = sims4.commands.CheatOutput(_connection)
     if not _bridge_available():
         output("PlumbMate: socket bridge unavailable in this build.")
@@ -217,6 +313,9 @@ def plumbmate_bridge_start(_connection=None):
         if previous is not None:
             previous.close()
         TICK_DRIVER.attach(plumbmate_bridge_client.BridgeClient(token, port, host=host))
+        # A hand-bound client is only "current" if it matches the live endpoint;
+        # otherwise leave the marker unset so the binder replaces it later.
+        _BOUND_ENDPOINT = _live_endpoint()
         # Zone.update(self, absolute_ticks); the wrapper runs the original first.
         plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
     except Exception as exc:
@@ -227,6 +326,8 @@ def plumbmate_bridge_start(_connection=None):
 
 @sims4.commands.Command("plumbmate.bridge.stop", command_type=sims4.commands.CommandType.Live)
 def plumbmate_bridge_stop(_connection=None):
+    """Unhook and unbind. Also stops autostart, which only runs from the hook."""
+    global _BOUND_ENDPOINT, AUTOSTART_STATE
     output = sims4.commands.CheatOutput(_connection)
     if not _bridge_available():
         output("PlumbMate: socket bridge unavailable in this build.")
@@ -236,10 +337,13 @@ def plumbmate_bridge_stop(_connection=None):
         client = TICK_DRIVER.detach()
         if client is not None:
             client.close()
+        _BOUND_ENDPOINT = None
+        AUTOSTART_STATE = "stopped_by_command"
     except Exception as exc:
         output("PlumbMate bridge stop failed: {}".format(_safe_text(exc)))
         return
-    output("PlumbMate bridge stopped; Zone.update restored.")
+    output("PlumbMate bridge stopped; Zone.update restored. "
+           "Autostart resumes on the next game start.")
 
 
 @sims4.commands.Command("plumbmate.bridge.status", command_type=sims4.commands.CommandType.Live)
@@ -249,10 +353,14 @@ def plumbmate_bridge_status(_connection=None):
         output("PlumbMate: socket bridge unavailable in this build.")
         return
     client = TICK_DRIVER.client
-    output("hook={} active={} driver={}".format(
-        _hook_installed(), TICK_DRIVER.active, TICK_DRIVER.stats))
+    output("hook={} active={} autostart={}".format(
+        _hook_installed(), TICK_DRIVER.active, AUTOSTART_STATE))
+    output("driver={}".format(TICK_DRIVER.stats))
+    if TICK_DRIVER.last_bind_error:
+        output("last_bind_error={}".format(_safe_text(TICK_DRIVER.last_bind_error)))
     if client is None:
-        output("No client bound. Run plumbmate.bridge.start.")
+        output("No client bound. Start 'plumbmate listen' in the companion, "
+               "or run plumbmate.bridge.start.")
         return
     output("state={} queued={} awaiting_ack={} backoff={}s".format(
         client.state, client.queued, client.awaiting_ack, client.backoff_seconds))
@@ -283,6 +391,7 @@ def plumbmate_status(_connection=None):
     output("socket bridge: {} ({})".format(
         "available" if available else "unavailable", reason))
     output("tick hook: {}".format("installed" if _hook_installed() else "not installed"))
+    output("autostart: {}".format(AUTOSTART_STATE))
 
 
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)
@@ -317,3 +426,10 @@ def plumbmate_read(_connection=None):
     except Exception as exc:
         output("PlumbMate response failed: {}".format(_safe_text(exc)))
 
+
+# Mod load runs this. It must not raise: an exception during import would leave
+# the game without the commands above, which are the only way to diagnose it.
+try:
+    start_autostart()
+except Exception as _exc:
+    AUTOSTART_STATE = "autostart_raised: {}: {}".format(type(_exc).__name__, _exc)
