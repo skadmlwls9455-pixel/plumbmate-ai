@@ -90,8 +90,16 @@ def validate_response(value: dict[str, Any]) -> None:
     action = value["action"]
     if not isinstance(action, dict) or action.get("name") not in ALLOWED_ACTIONS:
         raise ProtocolError("Response action is not allow-listed")
-    if not isinstance(value["memory_patch"], list) or len(value["memory_patch"]) > 3:
+    message = value["partner_message"]
+    # The provider schema already bounds these, but this function is the trust
+    # boundary for anything read back off the file bridge, edited or not.
+    if not isinstance(message, str) or len(message) > 2000:
+        raise ProtocolError("Response partner_message must be a string of at most 2000 characters")
+    patch = value["memory_patch"]
+    if not isinstance(patch, list) or len(patch) > 3:
         raise ProtocolError("Response memory_patch is invalid")
+    if any(not isinstance(item, str) or len(item) > 500 for item in patch):
+        raise ProtocolError("Response memory_patch items must be strings of at most 500 characters")
 
 
 def pending_requests(paths: BridgePaths) -> Iterable[Path]:

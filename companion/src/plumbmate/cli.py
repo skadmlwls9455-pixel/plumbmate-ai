@@ -173,9 +173,13 @@ def main(argv: list[str] | None = None) -> int:
                 clear_endpoint(paths)
         return 0
     if args.command == "mock-event":
-        payload = json.loads(args.payload)
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as exc:
+            print(f"payload is not valid JSON: {exc}", file=sys.stderr)
+            return 2
         if not isinstance(payload, dict):
-            print("payload must be a JSON object")
+            print("payload must be a JSON object", file=sys.stderr)
             return 2
         with BridgeClient(load_token(paths), args.port) as client:
             print(json.dumps(client.send_event(args.kind, payload), ensure_ascii=False))

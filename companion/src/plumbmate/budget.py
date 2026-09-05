@@ -34,13 +34,28 @@ def state_delta(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, 
     return changed
 
 
+def _clamp_person(entry: Any) -> Any:
+    """Bound the name inside one actor/household entry; a corrupted or
+    hostile save must not smuggle unbounded text into model context."""
+    if not isinstance(entry, dict):
+        return entry
+    bounded = dict(entry)
+    if "name" in bounded:
+        bounded["name"] = str(bounded["name"])[:120]
+    return bounded
+
+
 def clamp_request(request: dict[str, Any]) -> dict[str, Any]:
     """Bound untrusted bridge input before it can become model context."""
     result = dict(request)
     result["player_message"] = str(result.get("player_message", ""))[:1000]
     result["memory_summary"] = str(result.get("memory_summary", ""))[:1600]
     result["recent_events"] = [str(item)[:240] for item in result.get("recent_events", [])[-8:]]
-    result["household"] = list(result.get("household", []))[:12]
+    result["household"] = [
+        _clamp_person(entry) for entry in list(result.get("household", []))[:12]
+    ]
+    if isinstance(result.get("actor"), dict):
+        result["actor"] = _clamp_person(result["actor"])
     return result
 
 

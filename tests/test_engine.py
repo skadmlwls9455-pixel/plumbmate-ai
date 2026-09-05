@@ -150,5 +150,34 @@ class EngineTests(unittest.TestCase):
         )
 
 
+class TrustBoundaryTests(unittest.TestCase):
+    """Bounds that hold even for hand-edited bridge files and hostile saves."""
+
+    def test_unbounded_names_are_clamped_before_model_context(self):
+        from plumbmate.budget import clamp_request
+        request = valid_request()
+        request["actor"]["name"] = "가" * 5000
+        request["household"] = [{"sim_id": 1, "name": "나" * 5000}]
+        clamped = clamp_request(request)
+        self.assertEqual(len(clamped["actor"]["name"]), 120)
+        self.assertEqual(len(clamped["household"][0]["name"]), 120)
+
+    def test_oversized_or_nonstring_response_fields_are_rejected(self):
+        from plumbmate.protocol import ProtocolError, validate_response
+        from plumbmate.providers import MockProvider
+        base = MockProvider().respond(valid_request())
+        for mutate in (
+            lambda r: r.update(partner_message="x" * 2001),
+            lambda r: r.update(partner_message=42),
+            lambda r: r.update(memory_patch=["y" * 501]),
+            lambda r: r.update(memory_patch=[{"not": "a string"}]),
+        ):
+            broken = dict(base)
+            mutate(broken)
+            with self.assertRaises(ProtocolError):
+                validate_response(broken)
+        validate_response(base)
+
+
 if __name__ == "__main__":
     unittest.main()
