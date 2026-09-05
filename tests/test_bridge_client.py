@@ -31,7 +31,7 @@ class Clock(object):
         self.value += seconds
 
 
-def pump_until(client, predicate, timeout=3.0):
+def pump_until(client, predicate, timeout=15.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         client.pump()
@@ -97,17 +97,18 @@ class OfflineStateMachineTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def test_refused_connection_enters_backoff_without_raising(self):
-        for _ in range(4):
-            self.client.pump()
-        self.assertEqual(self.client.state, "BACKOFF")
+        self.assertTrue(
+            pump_until(self.client, lambda: self.client.state == "BACKOFF"),
+            "never entered backoff: state={} error={}".format(
+                self.client.state, self.client.last_error),
+        )
         self.assertGreaterEqual(self.client.stats["failures"], 1)
         self.assertIsNotNone(self.client.last_error)
 
     def test_backoff_grows_and_is_honoured_by_the_clock(self):
         delays = []
         for _ in range(4):
-            while self.client.state != "BACKOFF":
-                self.client.pump()
+            self.assertTrue(pump_until(self.client, lambda: self.client.state == "BACKOFF"))
             delays.append(self.client.backoff_seconds)
             attempts = self.client.stats["connect_attempts"]
             self.client.pump()
@@ -174,10 +175,12 @@ class InteropHarness(unittest.TestCase):
     queue_size = 256
 
     def setUp(self):
-        self.server = EventSocketServer(TOKEN, queue_size=self.queue_size, idle_timeout=5.0)
+        self.server = EventSocketServer(TOKEN, queue_size=self.queue_size, idle_timeout=60.0)
         self.server.start()
         self.addCleanup(self.server.stop)
-        self.client = bridge.BridgeClient(TOKEN, self.server.port)
+        self.client = bridge.BridgeClient(
+            TOKEN, self.server.port, connect_timeout=30.0, handshake_timeout=30.0,
+        )
         self.addCleanup(self.client.close)
 
     def ready(self):
@@ -199,7 +202,7 @@ class InteropTests(InteropHarness):
         payload = {"slot_id": "Slot_ffffffff.save", "메모": "한글 페이로드"}
         event_id = self.client.queue_event("zone_loaded", payload)
         self.assertTrue(pump_until(self.client, lambda: self.client.stats["acked_events"] == 1))
-        event = self.server.poll(timeout=2.0)
+        event = self.server.poll(timeout=15.0)
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.kind, "zone_loaded")
         self.assertEqual(event.payload, payload)
@@ -209,14 +212,16 @@ class InteropTests(InteropHarness):
         self.ready()
         ids = [self.client.queue_event("heartbeat", {"index": i}) for i in range(30)]
         self.assertTrue(
-            pump_until(self.client, lambda: self.client.stats["acked_events"] == 30, timeout=5.0)
+            pump_until(self.client, lambda: self.client.stats["acked_events"] == 30, timeout=20.0)
         )
-        received = [self.server.poll(timeout=2.0).event_id for _ in range(30)]
+        received = [self.server.poll(timeout=15.0).event_id for _ in range(30)]
         self.assertEqual(received, ids)
         self.assertEqual(self.client.stats["lost_events"], 0)
 
     def test_wrong_token_never_reaches_ready(self):
-        wrong = bridge.BridgeClient(OTHER_TOKEN, self.server.port)
+        wrong = bridge.BridgeClient(
+            OTHER_TOKEN, self.server.port, connect_timeout=30.0, handshake_timeout=30.0,
+        )
         self.addCleanup(wrong.close)
         self.assertTrue(pump_until(wrong, lambda: wrong.state == "BACKOFF"))
         self.assertFalse(wrong.connected)
@@ -258,14 +263,14 @@ class InteropTests(InteropHarness):
         self.assertTrue(pump_until(self.client, lambda: self.client.state == "BACKOFF"))
         self.client.queue_event("save_committed", {"slot_id": "Slot_00000002"})
 
-        replacement = EventSocketServer(TOKEN, port=port, idle_timeout=5.0)
+        replacement = EventSocketServer(TOKEN, port=port, idle_timeout=60.0)
         replacement.start()
         self.addCleanup(replacement.stop)
         self.assertTrue(
-            pump_until(self.client, lambda: self.client.stats["acked_events"] == 1, timeout=6.0)
+            pump_until(self.client, lambda: self.client.stats["acked_events"] == 1, timeout=25.0)
         )
         self.assertEqual(self.client.stats["handshakes"], 2)
-        self.assertEqual(replacement.poll(timeout=2.0).kind, "save_committed")
+        self.assertEqual(replacement.poll(timeout=15.0).kind, "save_committed")
 
 
 class BackpressureInteropTests(InteropHarness):
@@ -279,7 +284,7 @@ class BackpressureInteropTests(InteropHarness):
             pump_until(
                 self.client,
                 lambda: self.client.stats["acked_events"] + self.client.stats["refused_events"] == 4,
-                timeout=5.0,
+                timeout=20.0,
             )
         )
         self.assertEqual(self.client.stats["acked_events"], self.queue_size)

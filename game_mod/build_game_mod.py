@@ -53,6 +53,7 @@ def build(output: Path, game_app: Path = DEFAULT_GAME_APP, *, diagnostic: bool =
         compile_units.extend([
             (source_root / "plumbmate_mod" / "probe_core.py", Path("plumbmate_probe_core.pyc")),
             (source_root / "plumbmate_mod" / "ownership_probe.py", Path("plumbmate_ownership_probe.pyc")),
+            (source_root / "plumbmate_mod" / "socket_probe.py", Path("plumbmate_socket_probe.pyc")),
         ])
     else:
         # commands.py imports these by their published root-level names.

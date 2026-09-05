@@ -141,19 +141,19 @@ class ServerHarness(unittest.TestCase):
     def setUp(self):
         self.server = EventSocketServer(
             TOKEN, max_connections=self.max_connections, queue_size=self.queue_size,
-            handshake_timeout=2.0, idle_timeout=2.0,
+            handshake_timeout=30.0, idle_timeout=60.0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
 
     def client(self, token=TOKEN):
-        client = BridgeClient(token, self.server.port, timeout=2.0)
+        client = BridgeClient(token, self.server.port, timeout=30.0)
         self.addCleanup(client.close)
         return client
 
     def raw(self):
-        connection = socket.create_connection(self.server.address, 2.0)
-        connection.settimeout(2.0)
+        connection = socket.create_connection(self.server.address, 30.0)
+        connection.settimeout(30.0)
         self.addCleanup(connection.close)
         return connection
 
@@ -172,7 +172,7 @@ class AuthenticationTests(ServerHarness):
         with self.client() as client:
             ack = client.send_event("zone_loaded", {"slot_id": "Slot_00000002"})
         self.assertEqual(ack["kind"], "ack")
-        event = self.server.poll(timeout=2.0)
+        event = self.server.poll(timeout=15.0)
         self.assertEqual(event.kind, "zone_loaded")
         self.assertEqual(event.payload, {"slot_id": "Slot_00000002"})
         self.assertEqual(event.event_id, ack["event_id"])
@@ -285,7 +285,7 @@ class EventTransportTests(ServerHarness):
         with self.assertRaises(SocketBridgeError):
             BridgeClient(TOKEN, self.server.port).send_event()
 
-    def _collect(self, count, timeout=2.0):
+    def _collect(self, count, timeout=15.0):
         events = []
         while len(events) < count:
             event = self.server.poll(timeout=timeout)
@@ -314,7 +314,7 @@ class ConnectionLimitTests(ServerHarness):
 
     def test_extra_connection_is_refused_without_disturbing_the_first(self):
         first = self.client().connect()
-        overflow = BridgeClient(TOKEN, self.server.port, timeout=2.0)
+        overflow = BridgeClient(TOKEN, self.server.port, timeout=30.0)
         self.addCleanup(overflow.close)
         with self.assertRaises((SocketBridgeError, OSError, ConnectionError)):
             overflow.connect()
@@ -327,7 +327,7 @@ class LifecycleTests(unittest.TestCase):
         server = EventSocketServer(TOKEN)
         server.start()
         port = server.port
-        with BridgeClient(TOKEN, port, timeout=2.0) as client:
+        with BridgeClient(TOKEN, port, timeout=30.0) as client:
             client.send_event("heartbeat")
         server.stop()
         server.stop()

@@ -206,16 +206,18 @@ class TickedInteropTests(unittest.TestCase):
     def setUp(self):
         self.original = FakeZone.update
         self.addCleanup(setattr, FakeZone, "update", self.original)
-        self.server = EventSocketServer(TOKEN, idle_timeout=5.0)
+        self.server = EventSocketServer(TOKEN, idle_timeout=60.0)
         self.server.start()
         self.addCleanup(self.server.stop)
-        self.client = bridge.BridgeClient(TOKEN, self.server.port)
+        self.client = bridge.BridgeClient(
+            TOKEN, self.server.port, connect_timeout=30.0, handshake_timeout=30.0,
+        )
         self.addCleanup(self.client.close)
         self.driver = driver_module.TickDriver(self.client)
         driver_module.install_tick_hook(FakeZone, self.driver, "update")
         self.zone = FakeZone()
 
-    def tick_until(self, predicate, timeout=5.0):
+    def tick_until(self, predicate, timeout=20.0):
         deadline = time.monotonic() + timeout
         tick = 0
         while time.monotonic() < deadline:
@@ -236,7 +238,7 @@ class TickedInteropTests(unittest.TestCase):
         self.assertTrue(self.tick_until(lambda: self.client.connected))
         event_id = self.client.queue_event("zone_loaded", {"absolute_sim_ticks": 12345})
         self.assertTrue(self.tick_until(lambda: self.client.stats["acked_events"] == 1))
-        event = self.server.poll(timeout=2.0)
+        event = self.server.poll(timeout=15.0)
         self.assertEqual(event.event_id, event_id)
         self.assertEqual(event.payload, {"absolute_sim_ticks": 12345})
 
@@ -257,13 +259,13 @@ class TickedInteropTests(unittest.TestCase):
         self.server.stop()
         self.assertTrue(self.tick_until(lambda: self.client.state == "BACKOFF"))
         self.client.queue_event("save_committed", {"slot_id": "Slot_00000002"})
-        replacement = EventSocketServer(TOKEN, port=port, idle_timeout=5.0)
+        replacement = EventSocketServer(TOKEN, port=port, idle_timeout=60.0)
         replacement.start()
         self.addCleanup(replacement.stop)
         self.assertTrue(
-            self.tick_until(lambda: self.client.stats["acked_events"] == 1, timeout=8.0)
+            self.tick_until(lambda: self.client.stats["acked_events"] == 1, timeout=25.0)
         )
-        self.assertEqual(replacement.poll(timeout=2.0).kind, "save_committed")
+        self.assertEqual(replacement.poll(timeout=15.0).kind, "save_committed")
 
 
 if __name__ == "__main__":

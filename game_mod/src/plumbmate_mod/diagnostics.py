@@ -3,6 +3,10 @@
 This file is packaged separately from the production bridge. A one-shot startup
 probe checks the real game process, not a host Python or isolated helper. It
 records module import capability only and never opens a SQLite connection.
+
+The socket section additionally completes a 127.0.0.1 round trip, because
+importing the wrapper does not prove the extension loads or that the loopback
+stack works. No external address is contacted and nothing sleeps.
 """
 
 import datetime
@@ -11,7 +15,12 @@ import os
 import sys
 import uuid
 
-PROBE_REVISION = "runtime-1"
+try:
+    import plumbmate_socket_probe
+except Exception:
+    plumbmate_socket_probe = None
+
+PROBE_REVISION = "runtime-2"
 SESSION_ID = uuid.uuid4().hex
 
 
@@ -50,6 +59,14 @@ def runtime_probe():
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
+    if plumbmate_socket_probe is None:
+        payload["socket"] = {"verdict": "NOT_PACKAGED"}
+    else:
+        try:
+            payload["socket"] = plumbmate_socket_probe.probe_socket_capability()
+        except Exception as exc:
+            payload["socket"] = {"verdict": "PROBE_FAILED",
+                                 "error_type": type(exc).__name__, "error": str(exc)}
     root = _diagnostic_directory()
     if not os.path.isdir(root):
         os.makedirs(root)
@@ -66,6 +83,13 @@ except Exception as probe_error:
     # Development diagnostics must never prevent the game's startup.
     RUNTIME_RESULT = {"probe": "FAILED", "error": str(probe_error)}
     print("PlumbMate diagnostic failed: {}".format(probe_error))
+else:
+    if plumbmate_socket_probe is not None:
+        try:
+            print("PlumbMate {}".format(
+                plumbmate_socket_probe.summary_line(RUNTIME_RESULT.get("socket", {}))))
+        except Exception:
+            pass
 
 
 try:

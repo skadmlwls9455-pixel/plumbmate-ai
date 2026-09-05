@@ -12,18 +12,26 @@ import sims4.commands
 # The build publishes these as root-level modules, like the diagnostic probe.
 # A partial or stale install must degrade to the filesystem bridge, not break
 # the whole mod at import, so both imports are guarded.
+# The import error itself is the answer to "does socket work in the game?",
+# so it is kept rather than collapsed into a None check.
 try:
     import plumbmate_bridge_client
-except Exception:
+    _BRIDGE_CLIENT_ERROR = None
+except Exception as _exc:
     plumbmate_bridge_client = None
+    _BRIDGE_CLIENT_ERROR = "{}: {}".format(type(_exc).__name__, _exc)
 try:
     import plumbmate_tick_driver
-except Exception:
+    _TICK_DRIVER_ERROR = None
+except Exception as _exc:
     plumbmate_tick_driver = None
+    _TICK_DRIVER_ERROR = "{}: {}".format(type(_exc).__name__, _exc)
 try:
     import zone
-except Exception:
+    _ZONE_ERROR = None
+except Exception as _exc:
     zone = None
+    _ZONE_ERROR = "{}: {}".format(type(_exc).__name__, _exc)
 
 
 PROTOCOL_VERSION = "0.1"
@@ -164,9 +172,26 @@ def _read_endpoint():
         return "127.0.0.1", DEFAULT_BRIDGE_PORT
 
 
+def _bridge_reason():
+    """Return (available, reason). Importing socket is only half the question."""
+    if plumbmate_bridge_client is None:
+        return False, "bridge_client import failed: {}".format(_BRIDGE_CLIENT_ERROR)
+    if plumbmate_tick_driver is None or TICK_DRIVER is None:
+        return False, "tick_driver import failed: {}".format(_TICK_DRIVER_ERROR)
+    if zone is None:
+        return False, "zone import failed: {}".format(_ZONE_ERROR)
+    # A loaded wrapper does not prove the extension can make a socket.
+    try:
+        network = plumbmate_bridge_client.socket
+        probe = network.socket(network.AF_INET, network.SOCK_STREAM)
+        probe.close()
+    except Exception as exc:
+        return False, "socket creation failed: {}: {}".format(type(exc).__name__, exc)
+    return True, "socket created and closed"
+
+
 def _bridge_available():
-    return (plumbmate_bridge_client is not None and plumbmate_tick_driver is not None
-            and zone is not None and TICK_DRIVER is not None)
+    return _bridge_reason()[0]
 
 
 def _hook_installed():
@@ -254,8 +279,10 @@ def plumbmate_status(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
     root = _ensure_directories()
     output("PlumbMate prototype 0.1 | bridge: {}".format(root))
-    output("socket bridge: {} | tick hook: {}".format(
-        "available" if _bridge_available() else "unavailable", _hook_installed()))
+    available, reason = _bridge_reason()
+    output("socket bridge: {} ({})".format(
+        "available" if available else "unavailable", reason))
+    output("tick hook: {}".format("installed" if _hook_installed() else "not installed"))
 
 
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)
