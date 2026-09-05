@@ -1,0 +1,26 @@
+name: tests
+
+# The offline suite needs no game and no API key, so it runs everywhere.
+# Linux coverage matters: the buffered-frame starvation bug in the bridge
+# client reproduced on Linux loopback batching while passing on macOS.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run offline test suite
+        env:
+          PYTHONPATH: companion/src
+        run: python -m unittest discover -s tests

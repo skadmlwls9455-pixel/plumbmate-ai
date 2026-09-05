@@ -43,8 +43,13 @@ except Exception as _exc:
 
 PROTOCOL_VERSION = "0.1"
 ARCHIVE_SUFFIX = ".ts4script"
-DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
+
+# An endpoint file that advertises a refresh cadence but has not been touched
+# for this many multiples of it belongs to a companion that died without
+# cleaning up. Files without the field (older companions) are never aged out.
+ENDPOINT_STALE_MULTIPLIER = 6.0
+ENDPOINT_STALE_FLOOR_SECONDS = 30.0
 
 # Initialized at import; idle until a client is bound, by autostart or by hand.
 TICK_DRIVER = plumbmate_tick_driver.TickDriver() if plumbmate_tick_driver else None
@@ -175,16 +180,6 @@ def _read_token():
         return handle.read().strip()
 
 
-def _read_endpoint():
-    """Discover the companion's port; the file carries no secret."""
-    try:
-        with open(_state_file("bridge-endpoint.json"), "r", encoding="utf-8") as handle:
-            endpoint = json.load(handle)
-        return endpoint.get("host", "127.0.0.1"), int(endpoint["port"])
-    except Exception:
-        return "127.0.0.1", DEFAULT_BRIDGE_PORT
-
-
 def _bridge_reason():
     """Return (available, reason). Importing socket is only half the question."""
     if plumbmate_bridge_client is None:
@@ -219,10 +214,23 @@ def _live_endpoint():
     it asks the kernel for a free port by default, so the file is both the
     liveness signal and the only way to learn the current port. Its absence is
     the ordinary case of "the companion is not running", not an error.
+
+    A companion killed without cleanup (crash, force quit) leaves the file
+    behind. Newer companions therefore advertise ``refresh_seconds`` and touch
+    the file on that cadence while alive; a file that has aged far past its own
+    cadence is treated as absent. Files without the field never age out, so an
+    older companion keeps working exactly as before.
     """
     try:
-        with open(_state_file("bridge-endpoint.json"), "r", encoding="utf-8") as handle:
+        path = _state_file("bridge-endpoint.json")
+        with open(path, "r", encoding="utf-8") as handle:
             endpoint = json.load(handle)
+        refresh = endpoint.get("refresh_seconds")
+        if refresh:
+            age = time.time() - os.path.getmtime(path)
+            if age > max(ENDPOINT_STALE_FLOOR_SECONDS,
+                         float(refresh) * ENDPOINT_STALE_MULTIPLIER):
+                return None
         return endpoint.get("host", "127.0.0.1"), int(endpoint["port"])
     except Exception:
         return None
@@ -258,7 +266,9 @@ def _autostart_binder(current):
         return None
     client = plumbmate_bridge_client.BridgeClient(token, endpoint[1], host=endpoint[0])
     if current is not None:
-        # The endpoint moved; the old socket has nothing left to reach.
+        # The endpoint moved; the old socket has nothing left to reach. Events
+        # it never sent carry no duplication risk, so they follow the move.
+        client.adopt_outbox(current)
         current.close()
     _BOUND_ENDPOINT = endpoint
     AUTOSTART_STATE = "bound"
@@ -302,20 +312,29 @@ def plumbmate_bridge_start(_connection=None):
     if not _bridge_available():
         output("PlumbMate: socket bridge unavailable in this build.")
         return
+    endpoint = _live_endpoint()
+    if endpoint is None:
+        # There is no port worth guessing: 'plumbmate listen' takes a kernel-
+        # assigned one, so without its endpoint file a connection cannot work.
+        output("PlumbMate: companion is not publishing an endpoint. "
+               "Start 'plumbmate listen' first, then run this again.")
+        return
+    host, port = endpoint
     try:
         token = _read_token()
     except Exception:
         output("PlumbMate: no bridge token. Run 'plumbmate token' in the companion.")
         return
-    host, port = _read_endpoint()
     try:
+        # Build the replacement before touching the bound client, so a failed
+        # construction leaves the current binding exactly as it was.
+        client = plumbmate_bridge_client.BridgeClient(token, port, host=host)
         previous = TICK_DRIVER.detach()
         if previous is not None:
+            client.adopt_outbox(previous)
             previous.close()
-        TICK_DRIVER.attach(plumbmate_bridge_client.BridgeClient(token, port, host=host))
-        # A hand-bound client is only "current" if it matches the live endpoint;
-        # otherwise leave the marker unset so the binder replaces it later.
-        _BOUND_ENDPOINT = _live_endpoint()
+        TICK_DRIVER.attach(client)
+        _BOUND_ENDPOINT = endpoint
         # Zone.update(self, absolute_ticks); the wrapper runs the original first.
         plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
     except Exception as exc:

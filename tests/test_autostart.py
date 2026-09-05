@@ -44,11 +44,14 @@ def _install_game_stubs():
         Live = "Live"
 
     class CheatOutput(object):
+        transcript = []  # class-level so tests can read what commands printed
+
         def __init__(self, connection=None):
             self.lines = []
 
         def __call__(self, line):
             self.lines.append(line)
+            type(self).transcript.append(line)
 
     def Command(*names, **kwargs):
         return lambda function: function
@@ -123,17 +126,30 @@ class AutostartTests(unittest.TestCase):
             sys.modules["plumbmate_tick_driver"].remove_tick_hook(self.zone_class, "update")
         except Exception:
             pass
+        try:
+            client = module.TICK_DRIVER.detach()
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
 
     def write_token(self):
         self.state.mkdir(parents=True, exist_ok=True)
         (self.state / "bridge-token").write_text(TOKEN, encoding="utf-8")
 
-    def write_endpoint(self, port, host="127.0.0.1"):
+    def write_endpoint(self, port, host="127.0.0.1", refresh_seconds=None):
         self.state.mkdir(parents=True, exist_ok=True)
+        payload = {"host": host, "port": int(port), "protocol_version": "0.1"}
+        if refresh_seconds is not None:
+            payload["refresh_seconds"] = refresh_seconds
         (self.state / "bridge-endpoint.json").write_text(
-            json.dumps({"host": host, "port": int(port), "protocol_version": "0.1"}),
-            encoding="utf-8",
+            json.dumps(payload), encoding="utf-8",
         )
+
+    def age_endpoint(self, seconds):
+        target = self.state / "bridge-endpoint.json"
+        stamp = time.time() - seconds
+        os.utime(str(target), (stamp, stamp))
 
     def clear_endpoint(self):
         try:
@@ -281,6 +297,86 @@ class AutostartTests(unittest.TestCase):
         self.assertEqual(module.AUTOSTART_STATE, "disabled_by_file")
         self.assertFalse(module._hook_installed())
         self.assertIsNone(module.TICK_DRIVER.client)
+
+    def test_manual_start_without_a_live_endpoint_refuses(self):
+        # There is no port worth guessing; the command must say so, not bind
+        # a client to a port nothing will ever listen on.
+        self.write_token()
+        module = self.boot()
+        module.plumbmate_bridge_start()
+        self.assertIsNone(module.TICK_DRIVER.client)
+        transcript = "\n".join(sys.modules["sims4.commands"].CheatOutput.transcript)
+        self.assertIn("not publishing an endpoint", transcript)
+
+    def test_a_stale_endpoint_file_is_treated_as_absent(self):
+        # A file that advertises a refresh cadence but has aged far past it
+        # belongs to a companion that died without cleanup.
+        self.write_token()
+        self.write_endpoint(45999, refresh_seconds=1.0)
+        self.age_endpoint(300)
+        module = self.boot()
+        zone = self.zone_class()
+        for tick in range(50):
+            zone.update(tick)
+        self.assertIsNone(module.TICK_DRIVER.client)
+        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_companion")
+
+    def test_a_legacy_endpoint_without_cadence_never_ages_out(self):
+        # Older companions do not refresh the file; their endpoint files must
+        # keep working no matter how old they look.
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        self.write_token()
+        self.write_endpoint(server.port)
+        self.age_endpoint(3600)
+        module = self.boot()
+        zone = self.zone_class()
+        self.assertTrue(self.tick_until(
+            zone, lambda: module.TICK_DRIVER.client is not None
+            and module.TICK_DRIVER.client.connected
+        ), "legacy endpoint file was wrongly aged out")
+
+    def test_queued_events_survive_a_port_move(self):
+        first = EventSocketServer(TOKEN, idle_timeout=60.0)
+        first.start()
+        self.addCleanup(first.stop)
+        self.write_token()
+        self.write_endpoint(first.port)
+        module = self.boot()
+        zone = self.zone_class()
+        self.assertTrue(self.tick_until(
+            zone, lambda: module.TICK_DRIVER.client is not None
+            and module.TICK_DRIVER.client.connected
+        ))
+
+        # Stop the companion, queue an event while nothing is listening, then
+        # bring a new companion up on a different port. The queue happens only
+        # after the client has noticed the loss, so the event is verifiably
+        # unsent rather than in flight when the endpoint moves.
+        first_port = first.port
+        first.stop()
+        self.clear_endpoint()
+        self.assertTrue(self.tick_until(
+            zone, lambda: module.TICK_DRIVER.client.state != "READY"
+        ))
+        event_id = module.TICK_DRIVER.client.queue_event("heartbeat", {"source": "queued-offline"})
+        self.assertIsNotNone(event_id)
+
+        second = EventSocketServer(TOKEN, idle_timeout=60.0)
+        second.start()
+        self.addCleanup(second.stop)
+        self.assertNotEqual(second.port, first_port)
+        self.write_endpoint(second.port)
+
+        self.assertTrue(self.tick_until(
+            zone, lambda: module.TICK_DRIVER.client is not None
+            and module.TICK_DRIVER.client.stats["acked_events"] == 1,
+            timeout=25.0,
+        ), "the queued event never reached the new companion")
+        received = second.poll(timeout=15.0)
+        self.assertEqual(received.event_id, event_id)
+        self.assertEqual(received.payload, {"source": "queued-offline"})
 
     def test_stop_command_unhooks_and_leaves_the_engine_alone(self):
         server = EventSocketServer(TOKEN, idle_timeout=60.0)

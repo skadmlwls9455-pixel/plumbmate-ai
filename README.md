@@ -35,6 +35,11 @@ actions yet.
 The current game-side adapter reports only a safe, small identity/household
 snapshot. Action execution is intentionally disabled in this first milestone.
 
+The companion's `serve` loop survives any single request: a request the
+protocol rejects is quarantined into `archive/` with a `.reason.txt` sidecar,
+and a request the provider keeps failing on is retried with backoff and then
+quarantined, so one poisonous file can never wedge the queue.
+
 ## Event socket
 
 Alongside the file bridge, the mod opens a loopback socket to the companion so
@@ -51,6 +56,13 @@ Until then the hook is idle and connects to nothing.
 
 The socket is loopback-only and authenticated per connection with an HMAC
 answer to the server's nonce; the token itself is never sent.
+
+A companion that exits uncleanly leaves no trap: while alive it refreshes the
+endpoint file it published, so the mod ages out a file left behind by a crash
+instead of courting a dead port. `plumbmate.bridge.start` refuses to guess a
+port when no companion is publishing one, and when the companion restarts on a
+new port, events that were queued but never sent follow the move instead of
+vanishing with the old connection.
 
 ## Repository layout
 
