@@ -210,6 +210,24 @@ class BridgeClient(object):
         self.stats["queued_events"] += 1
         return frame["event_id"]
 
+    def adopt_outbox(self, other):
+        """Move another client's queued-but-unsent events into this outbox.
+
+        Used when the companion moves to a new port and the old client is about
+        to be replaced: its in-flight events are lost by design (at-most-once),
+        but events that were never sent carry no duplication risk and would
+        otherwise vanish with the discarded object. Entries that do not fit are
+        left on ``other`` and counted as rejected here.
+        """
+        adopted = 0
+        while other._outbox and len(self._outbox) < self._max_outbox:
+            self._outbox.append(other._outbox.pop(0))
+            adopted += 1
+        if other._outbox:
+            self.stats["rejected_by_outbox"] += len(other._outbox)
+        self.stats["queued_events"] += adopted
+        return adopted
+
     def pump(self):
         """Advance the connection by a bounded step; never blocks, never raises."""
         try:
@@ -296,7 +314,24 @@ class BridgeClient(object):
     def _read_frames(self):
         read_bytes = 0
         frames = 0
-        while read_bytes < MAX_READ_BYTES_PER_PUMP and frames < MAX_FRAMES_PER_PUMP:
+        while frames < MAX_FRAMES_PER_PUMP:
+            # Frames already buffered from an earlier recv are parsed first, so
+            # a burst larger than one pump's frame budget drains across pumps
+            # even when the socket has no new bytes to offer.
+            index = self._inbound.find(b"\n")
+            if index >= 0:
+                raw = bytes(self._inbound[:index])
+                del self._inbound[: index + 1]
+                frames += 1
+                self._handle_frame(raw)
+                if self.state in (BACKOFF, CLOSED):
+                    return
+                continue
+            if len(self._inbound) > self._max_frame_bytes:
+                self._fail("frame_too_large")
+                return
+            if read_bytes >= MAX_READ_BYTES_PER_PUMP:
+                return
             try:
                 chunk = self._socket.recv(4096)
             except OSError as exc:
@@ -309,18 +344,6 @@ class BridgeClient(object):
                 return
             read_bytes += len(chunk)
             self._inbound.extend(chunk)
-            while frames < MAX_FRAMES_PER_PUMP:
-                index = self._inbound.find(b"\n")
-                if index < 0:
-                    if len(self._inbound) > self._max_frame_bytes:
-                        self._fail("frame_too_large")
-                    return
-                raw = bytes(self._inbound[:index])
-                del self._inbound[: index + 1]
-                frames += 1
-                self._handle_frame(raw)
-                if self.state in (BACKOFF, CLOSED):
-                    return
 
     def _handle_frame(self, raw):
         try:

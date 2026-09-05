@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import socket
@@ -167,6 +168,104 @@ class OfflineStateMachineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.queue_event("chat_turn", {"text": "x" * (bridge.MAX_FRAME_BYTES + 1)})
         self.assertEqual(self.client.queued, 0)
+
+
+class FrameBurstTests(unittest.TestCase):
+    """Regression for the buffered-frame starvation bug.
+
+    When one recv returns more frames than a single pump's budget, the surplus
+    sits in the client's inbound buffer. Later pumps must drain that buffer
+    even though the socket has nothing new to offer — before the fix, the
+    EAGAIN on the next recv returned early and the buffered acks were never
+    parsed, wedging the client in READY with acks outstanding forever.
+    """
+
+    def test_buffered_frames_drain_without_new_bytes(self):
+        client = bridge.BridgeClient(TOKEN, 1)
+        self.addCleanup(client.close)
+        total = bridge.MAX_FRAMES_PER_PUMP + 8
+        event_ids = ["event-{}".format(index) for index in range(total)]
+        burst = b"".join(
+            json.dumps({
+                "protocol_version": bridge.PROTOCOL_VERSION,
+                "kind": "ack",
+                "event_id": event_id,
+            }).encode("utf-8") + b"\n"
+            for event_id in event_ids
+        )
+        self.assertLessEqual(len(burst), 4096, "burst must fit one recv call")
+
+        class OneBurstSocket(object):
+            def __init__(self):
+                self.chunks = [burst]
+
+            def recv(self, _size):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise OSError(errno.EAGAIN, "no new bytes on the wire")
+
+            def send(self, data):
+                return len(data)
+
+            def close(self):
+                pass
+
+        client._socket = OneBurstSocket()
+        client.state = bridge.READY
+        client._pending = list(event_ids)
+
+        client.pump()
+        self.assertEqual(client.stats["acked_events"], bridge.MAX_FRAMES_PER_PUMP)
+        client.pump()
+        self.assertEqual(client.stats["acked_events"], total)
+        self.assertEqual(client.awaiting_ack, 0)
+        self.assertEqual(client.state, "READY")
+
+
+class AdoptOutboxTests(unittest.TestCase):
+    """A replacement client takes over the old client's unsent events."""
+
+    def test_unsent_events_move_to_the_replacement(self):
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        new = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(old.close)
+        self.addCleanup(new.close)
+        for index in range(3):
+            self.assertIsNotNone(old.queue_event("heartbeat", {"index": index}))
+        self.assertEqual(new.adopt_outbox(old), 3)
+        self.assertEqual(old.queued, 0)
+        self.assertEqual(new.queued, 3)
+
+    def test_overflow_stays_behind_and_is_counted(self):
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        new = bridge.BridgeClient(TOKEN, closed_port(), max_outbox=2)
+        self.addCleanup(old.close)
+        self.addCleanup(new.close)
+        for index in range(5):
+            old.queue_event("heartbeat", {"index": index})
+        self.assertEqual(new.adopt_outbox(old), 2)
+        self.assertEqual(old.queued, 3)
+        self.assertEqual(new.queued, 2)
+        self.assertEqual(new.stats["rejected_by_outbox"], 3)
+
+    def test_adopted_events_reach_the_server_in_order(self):
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(old.close)
+        ids = [old.queue_event("heartbeat", {"index": index}) for index in range(3)]
+        new = bridge.BridgeClient(
+            TOKEN, server.port, connect_timeout=30.0, handshake_timeout=30.0,
+        )
+        self.addCleanup(new.close)
+        self.assertEqual(new.adopt_outbox(old), 3)
+        self.assertTrue(
+            pump_until(new, lambda: new.stats["acked_events"] == 3),
+            "adopted events were never acked: {}".format(new.last_error),
+        )
+        received = [server.poll(timeout=15.0).event_id for _ in range(3)]
+        self.assertEqual(received, ids)
 
 
 class InteropHarness(unittest.TestCase):
