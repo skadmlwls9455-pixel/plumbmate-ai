@@ -10,6 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .engine import CompanionEngine
+from .event_socket import (
+    ALLOWED_EVENT_KINDS,
+    BridgeClient,
+    EventSocketServer,
+    load_token,
+    token_path,
+    write_token,
+)
 from .protocol import BridgePaths, PROTOCOL_VERSION, atomic_write_json, read_json
 from .providers import create_provider
 
@@ -43,7 +51,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="plumbmate")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("init", "demo", "serve-once", "serve", "show-latest"):
+    commands = (
+        "init", "demo", "serve-once", "serve", "show-latest",
+        "token", "listen", "mock-event",
+    )
+    for command in commands:
         sub = subparsers.add_parser(command)
         sub.add_argument("--bridge", required=True, help="Local bridge directory")
         if command in {"serve-once", "serve"}:
@@ -52,6 +64,15 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--message", default="에이든, 오늘 우리 뭐 하면서 놀까?")
         if command == "serve":
             sub.add_argument("--interval", type=float, default=0.75)
+        if command == "token":
+            sub.add_argument("--rotate", action="store_true", help="Replace the stored token")
+        if command == "listen":
+            sub.add_argument("--port", type=int, default=0, help="0 asks for a free port")
+            sub.add_argument("--events", type=int, default=0, help="Stop after N events")
+        if command == "mock-event":
+            sub.add_argument("--port", type=int, required=True)
+            sub.add_argument("--kind", choices=sorted(ALLOWED_EVENT_KINDS), default="heartbeat")
+            sub.add_argument("--payload", default="{}", help="JSON object")
 
     args = parser.parse_args(argv)
     paths = bridge_from(args.bridge)
@@ -81,6 +102,38 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(max(0.1, args.interval))
         except KeyboardInterrupt:
             return 0
+    if args.command == "token":
+        target = token_path(paths)
+        if args.rotate or not target.exists():
+            write_token(paths)
+        print(load_token(paths))
+        return 0
+    if args.command == "listen":
+        # The socket layer is loopback-only and refuses to start without a token.
+        with EventSocketServer(load_token(paths), port=args.port) as server:
+            print(f"listening on 127.0.0.1:{server.port}", flush=True)
+            seen = 0
+            try:
+                while args.events <= 0 or seen < args.events:
+                    event = server.poll(timeout=0.5)
+                    if event is None:
+                        continue
+                    seen += 1
+                    print(json.dumps({
+                        "kind": event.kind, "event_id": event.event_id,
+                        "payload": event.payload, "received_at": event.received_at,
+                    }, ensure_ascii=False), flush=True)
+            except KeyboardInterrupt:
+                pass
+        return 0
+    if args.command == "mock-event":
+        payload = json.loads(args.payload)
+        if not isinstance(payload, dict):
+            print("payload must be a JSON object")
+            return 2
+        with BridgeClient(load_token(paths), args.port) as client:
+            print(json.dumps(client.send_event(args.kind, payload), ensure_ascii=False))
+        return 0
     if args.command == "show-latest":
         latest = newest_response(paths)
         if latest is None:
