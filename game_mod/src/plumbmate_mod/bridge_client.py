@@ -6,10 +6,15 @@ work and returns; progress happens across repeated ``pump()`` calls driven by a
 console command or a tick handler.
 
 The socket is non-blocking from creation and stays that way. Connection
-completion is detected with ``getpeername``/``SO_ERROR`` instead of ``select``,
-because the game's ``base.zip`` lib ships no select module and a missing import
-would break the mod at load time. Only socket, json, hmac, hashlib, uuid, time,
-and errno are used, and each was checked against the installed runtime.
+completion is detected with ``getpeername``/``SO_ERROR`` rather than ``select``.
+
+An earlier note here claimed select was absent from the game. That was wrong:
+it was scanned for in ``base.zip``'s ``lib/``, but the C extensions live in
+``Frameworks/lib-dynload/``, and the in-game probe found ``select.dylib`` there.
+The select-free path is kept anyway, because this client owns exactly one
+socket and polling it directly needs no extra module, but it is a preference
+now, not a constraint. Only socket, json, hmac, hashlib, uuid, time, and errno
+are used, and the in-game probe confirmed every one of them imports.
 
 The token is never sent; the server's per-connection nonce is answered with an
 HMAC proof, so a captured frame cannot be replayed on the next connection.

@@ -1,0 +1,100 @@
+{
+  "created_at": "2026-09-05T05:47:24.813711Z",
+  "executable": "/Applications/EA Games/The Sims 4.app/Contents/MacOS/The Sims 4",
+  "module_file": "/Users/kate/Documents/Electronic Arts/The Sims 4/Mods/00_PlumbMate_Test/PlumbMateDiagnostics.ts4script/plumbmate_diagnostics.pyc",
+  "pid": 37337,
+  "probe": "in_game_runtime",
+  "revision": "runtime-2",
+  "session_id": "2e5c07cbc4494317bacfb3614e251730",
+  "socket": {
+    "loopback": {
+      "port": 61279,
+      "result": "ROUND_TRIP_OK",
+      "spins": 136,
+      "stages": [
+        "listener_created",
+        "bound",
+        "listening",
+        "connect_ex_36",
+        "accepted",
+        "connected",
+        "sent",
+        "received"
+      ]
+    },
+    "missing_required": [],
+    "modules": {
+      "_socket": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Frameworks/lib-dynload/_socket.dylib",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "errno": {
+        "origin": "builtin",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "hashlib": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Data/Client/../Simulation/Gameplay/base.zip/lib/hashlib.pyc",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "hmac": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Data/Client/../Simulation/Gameplay/base.zip/lib/hmac.pyc",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "json": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Data/Client/../Simulation/Gameplay/base.zip/lib/json/__init__.pyc",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "select": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Frameworks/lib-dynload/select.dylib",
+        "required_by_bridge": false,
+        "result": "IMPORTED"
+      },
+      "selectors": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Data/Client/../Simulation/Gameplay/base.zip/lib/selectors.pyc",
+        "required_by_bridge": false,
+        "result": "IMPORTED"
+      },
+      "socket": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Data/Client/../Simulation/Gameplay/base.zip/lib/socket.pyc",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "ssl": {
+        "error": "No module named '_ssl'",
+        "error_type": "ModuleNotFoundError",
+        "required_by_bridge": false,
+        "result": "IMPORT_FAILED"
+      },
+      "time": {
+        "origin": "builtin",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      },
+      "uuid": {
+        "origin": "/Applications/EA Games/The Sims 4.app/Contents/Data/Client/../Simulation/Gameplay/base.zip/lib/uuid.pyc",
+        "required_by_bridge": true,
+        "result": "IMPORTED"
+      }
+    },
+    "probe": "socket_capability",
+    "verdict": "AVAILABLE"
+  },
+  "sqlite3": {
+    "error": "No module named 'sqlite3'",
+    "error_type": "ModuleNotFoundError",
+    "result": "IMPORT_FAILED"
+  },
+  "sys_version": "3.7.0 (default, Jan 23 2023, 10:12:00) \n[Clang 13.1.6 (clang-1316.0.21.2.5)]",
+  "version_info": [
+    3,
+    7,
+    0,
+    "final",
+    0
+  ]
+}
