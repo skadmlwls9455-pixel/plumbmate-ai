@@ -57,6 +57,23 @@ SKIPPED_EVENT_KINDS = frozenset(("heartbeat",))
 # decay.
 HALF_LIFE_DAYS = {"episodic": 7.0, "sentiment": 21.0, "relationship_summary": 30.0}
 
+# Lifecycle defaults (RFC-001 §8/§9). Everything is a status transition; the
+# only physical DELETE is purge_deleted(), an explicit two-step action.
+MERGE_WINDOW_DAYS = 3.0
+MERGE_MIN_COUNT = 3
+ARCHIVE_AFTER_DAYS = 90.0
+ARCHIVE_MAX_IMPORTANCE = 2
+INFERENCE_TTL_DAYS = 60.0
+# Repeated *identical* observations are worth folding; distinct utterances are
+# not, so chat turns and adapter-reported events are never merged.
+UNMERGEABLE_EVENT_KINDS = frozenset(("chat_turn", "chat_reply", "recent_event"))
+EVIDENCE_KINDS = ("player_confirm", "game_event")
+# Contradiction heuristic for ai_inferred rows: high keyword overlap with a
+# canon row plus an opposing polarity token. Deliberately narrow — it must
+# never quarantine a merely *different* inference.
+_POLARITY_PAIRS = (("좋아", "싫어"), ("있다", "없다"), ("한다", "않는다"), ("맞다", "틀리다"),
+                   ("good", "bad"), ("likes", "dislikes"), ("true", "false"))
+
 ROLE_WEIGHTS = {"actor": 1.0, "target": 1.0, "witness": 0.6, "mentioned": 0.4, "location": 0.5}
 # Per-turn caps keep one type from crowding the others out. Episodic rows are
 # the only type this slice produces, so they are bounded by max_pick alone;
@@ -132,6 +149,13 @@ CREATE TABLE IF NOT EXISTS retrieval_log (
   breakdown  TEXT NOT NULL,
   created_at REAL NOT NULL,
   PRIMARY KEY (turn_id, memory_id)
+);
+CREATE TABLE IF NOT EXISTS canon_promotions (
+  memory_id      INTEGER NOT NULL REFERENCES memories(memory_id),
+  old_provenance TEXT NOT NULL,
+  evidence_kind  TEXT NOT NULL CHECK (evidence_kind IN ('player_confirm','game_event')),
+  evidence_ref   TEXT NOT NULL,
+  promoted_at    REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS retrieval_config (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -317,8 +341,41 @@ class MemoryStore:
                 "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, role) VALUES (?,?,?)",
                 (memory_id, entity_id, role),
             )
+        if provenance == "ai_inferred" and status == "active":
+            conflict = self._contradicts_canon(session_id, keywords)
+            if conflict is not None:
+                # Quarantined, not deleted: it stays inspectable but never recalled.
+                self._db.execute(
+                    "UPDATE memories SET status = 'disputed', details = COALESCE(details, '') || ? WHERE memory_id = ?",
+                    (f" [disputes canon #{conflict}]", memory_id),
+                )
         self._db.commit()
         return memory_id
+
+    def _contradicts_canon(self, session_id: str, keywords: list[str]) -> int | None:
+        """Return the canon memory_id an inference contradicts, if the
+        heuristic fires: ≥60% of the canon row's keywords appear in the
+        inference AND the two carry opposite polarity tokens."""
+        tokens = set(keywords)
+        rows = self._db.execute(
+            "SELECT memory_id, keywords FROM memories WHERE session_id = ? AND memory_type = 'canon'"
+            " AND status = 'active'", (session_id,),
+        ).fetchall()
+        for row in rows:
+            canon_tokens = set(row["keywords"].split())
+            if not canon_tokens:
+                continue
+            content_a = {t for t in canon_tokens if not _polarity_of(t)}
+            overlap = len(content_a & tokens) / max(1, len(content_a))
+            if overlap < 0.6:
+                continue
+            polarity_canon = {_polarity_of(t) for t in canon_tokens} - {None}
+            polarity_new = {_polarity_of(t) for t in tokens} - {None}
+            if any((pair, "a") in polarity_canon and (pair, "b") in polarity_new
+                   or (pair, "b") in polarity_canon and (pair, "a") in polarity_new
+                   for pair in range(len(_POLARITY_PAIRS))):
+                return int(row["memory_id"])
+        return None
 
     def remember_turn_request(self, request: dict[str, Any]) -> list[int]:
         """Store what the player said (an observed utterance) and any events
@@ -555,6 +612,177 @@ class MemoryStore:
             )
         self._db.commit()
 
+    # ------------------------------------------------------------- lifecycle
+
+    def get(self, memory_id: int) -> dict[str, Any] | None:
+        row = self._db.execute("SELECT * FROM memories WHERE memory_id = ?", (memory_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def _require(self, memory_id: int) -> sqlite3.Row:
+        row = self._db.execute("SELECT * FROM memories WHERE memory_id = ?", (memory_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"No memory {memory_id}")
+        return row
+
+    def pin(self, memory_id: int, pinned: bool = True) -> None:
+        """Pinned rows are exempt from decay, merging, and archiving."""
+        self._require(memory_id)
+        self._db.execute("UPDATE memories SET pinned = ? WHERE memory_id = ?", (1 if pinned else 0, memory_id))
+        self._db.commit()
+
+    def edit(self, memory_id: int, summary: str, details: str | None = None) -> int:
+        """Correct a memory by superseding it: the old row keeps its history."""
+        old = self._require(memory_id)
+        if old["status"] in ("superseded", "merged", "deleted"):
+            raise ValueError(f"Memory {memory_id} is {old['status']} and cannot be edited")
+        links = {int(r["entity_id"]): r["role"] for r in self._db.execute(
+            "SELECT entity_id, role FROM memory_entities WHERE memory_id = ?", (memory_id,))}
+        new_id = self.add_memory(
+            old["session_id"], old["memory_type"], summary,
+            provenance=old["provenance"], importance=old["importance"], confidence=old["confidence"],
+            event_kind=old["event_kind"], status=old["status"], entities=links,
+            details=details if details is not None else old["details"],
+            trigger_keywords=json.loads(old["trigger_keywords"]) if old["trigger_keywords"] else None,
+            pinned=bool(old["pinned"]), created_at=old["created_at_real"],
+        )
+        self._db.execute(
+            "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE memory_id = ?", (new_id, memory_id),
+        )
+        self._db.commit()
+        return new_id
+
+    def soft_delete(self, memory_id: int) -> None:
+        """Step one of deletion: hidden from every recall, row retained."""
+        self._require(memory_id)
+        self._db.execute("UPDATE memories SET status = 'deleted' WHERE memory_id = ?", (memory_id,))
+        self._db.commit()
+
+    def purge_deleted(self) -> int:
+        """Step two, explicit: physically remove rows already soft-deleted."""
+        ids = [int(r["memory_id"]) for r in self._db.execute("SELECT memory_id FROM memories WHERE status = 'deleted'")]
+        for memory_id in ids:
+            self._db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+            self._db.execute("DELETE FROM retrieval_log WHERE memory_id = ?", (memory_id,))
+            self._db.execute("DELETE FROM canon_promotions WHERE memory_id = ?", (memory_id,))
+            if self.fts_available:
+                self._db.execute("INSERT INTO memories_fts (memories_fts, rowid, summary, keywords) VALUES ('delete', ?, '', '')",
+                                 (memory_id,))
+            self._db.execute("DELETE FROM memories WHERE memory_id = ?", (memory_id,))
+        self._db.commit()
+        return len(ids)
+
+    def promote_to_canon(self, memory_id: int, evidence_kind: str, evidence_ref: str) -> None:
+        """The single gate through which an inference may become canon.
+
+        Evidence is mandatory and is recorded forever in canon_promotions.
+        Repetition, recall count, or age never count as evidence.
+        """
+        if evidence_kind not in EVIDENCE_KINDS:
+            raise ValueError("evidence_kind must be one of " + ", ".join(EVIDENCE_KINDS))
+        evidence_ref = clip(str(evidence_ref or ""), 500)
+        if not evidence_ref:
+            raise ValueError("Promotion requires evidence: a player confirmation or a game event id")
+        row = self._require(memory_id)
+        if row["provenance"] == "player_canon" and row["memory_type"] == "canon":
+            return
+        if row["status"] in ("superseded", "merged", "deleted"):
+            raise ValueError(f"Memory {memory_id} is {row['status']} and cannot be promoted")
+        self._db.execute(
+            "INSERT INTO canon_promotions (memory_id, old_provenance, evidence_kind, evidence_ref, promoted_at)"
+            " VALUES (?,?,?,?,?)", (memory_id, row["provenance"], evidence_kind, evidence_ref, self._now()),
+        )
+        self._db.execute(
+            "UPDATE memories SET provenance = 'player_canon', confidence = 1.0, memory_type = 'canon',"
+            " status = 'active' WHERE memory_id = ?", (memory_id,),
+        )
+        self._db.commit()
+
+    def promotions(self, memory_id: int | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM canon_promotions"
+        args: tuple = ()
+        if memory_id is not None:
+            query += " WHERE memory_id = ?"
+            args = (memory_id,)
+        return [dict(r) for r in self._db.execute(query + " ORDER BY promoted_at", args)]
+
+    def consolidate(self, session_id: str | None = None, *, window_days: float = MERGE_WINDOW_DAYS,
+                    min_count: int = MERGE_MIN_COUNT) -> int:
+        """Fold repeated identical observations into one summary row.
+
+        Identical means same session, event_kind and summary text, at least
+        ``min_count`` times within ``window_days``. Originals become
+        status='merged' pointing at the summary; nothing is deleted. Chat
+        turns are never merged (each is distinct content), nor are pinned or
+        ai_inferred rows.
+        """
+        rows = self._db.execute(
+            "SELECT memory_id, session_id, event_kind, summary, provenance, importance, created_at_real"
+            " FROM memories WHERE status = 'active' AND memory_type = 'episodic' AND pinned = 0"
+            " AND provenance != 'ai_inferred' AND event_kind IS NOT NULL AND merged_into IS NULL"
+            " AND (? IS NULL OR session_id = ?) ORDER BY created_at_real", (session_id, session_id),
+        ).fetchall()
+        groups: dict[tuple, list[sqlite3.Row]] = {}
+        for row in rows:
+            if row["event_kind"] in UNMERGEABLE_EVENT_KINDS:
+                continue
+            groups.setdefault((row["session_id"], row["event_kind"], row["summary"]), []).append(row)
+        merged_groups = 0
+        window = window_days * 86400.0
+        for (scope, kind, summary), members in groups.items():
+            start = 0
+            while start < len(members):
+                end = start
+                while end + 1 < len(members) and members[end + 1]["created_at_real"] - members[start]["created_at_real"] <= window:
+                    end += 1
+                batch = members[start:end + 1]
+                if len(batch) >= min_count:
+                    self._merge(scope, kind, summary, batch)
+                    merged_groups += 1
+                start = end + 1
+        return merged_groups
+
+    def _merge(self, scope: str, kind: str, summary: str, batch: list[sqlite3.Row]) -> int:
+        ids = [int(r["memory_id"]) for r in batch]
+        provenance = "bridge_observed" if any(r["provenance"] == "bridge_observed" for r in batch) else batch[0]["provenance"]
+        links: dict[int, str] = {}
+        placeholders = ",".join("?" for _ in ids)
+        for r in self._db.execute(f"SELECT entity_id, role FROM memory_entities WHERE memory_id IN ({placeholders})", ids):
+            links.setdefault(int(r["entity_id"]), r["role"])
+        new_id = self.add_memory(
+            scope, "episodic", f"{summary} — {len(batch)}회 반복", provenance=provenance,
+            importance=max(int(r["importance"]) for r in batch), event_kind=kind, entities=links,
+            created_at=float(batch[-1]["created_at_real"]),
+        )
+        self._db.execute("UPDATE memories SET source_ids = ? WHERE memory_id = ?", (json.dumps(ids), new_id))
+        self._db.execute(
+            f"UPDATE memories SET status = 'merged', merged_into = ? WHERE memory_id IN ({placeholders})",
+            (new_id, *ids),
+        )
+        self._db.commit()
+        return new_id
+
+    def archive_stale(self, *, after_days: float = ARCHIVE_AFTER_DAYS,
+                      max_importance: int = ARCHIVE_MAX_IMPORTANCE,
+                      inference_ttl_days: float = INFERENCE_TTL_DAYS) -> int:
+        """Retire what nobody recalled: low-importance old rows, and unpromoted
+        inferences past their TTL (RFC-001 §9.5: guesses rot). Pinned rows and
+        canon are never archived."""
+        now = self._now()
+        cursor = self._db.execute(
+            "UPDATE memories SET status = 'archived' WHERE status = 'active' AND pinned = 0"
+            " AND memory_type != 'canon' AND recall_count = 0 AND importance <= ? AND created_at_real <= ?",
+            (max_importance, now - after_days * 86400.0),
+        )
+        archived = cursor.rowcount
+        cursor = self._db.execute(
+            "UPDATE memories SET status = 'archived' WHERE status = 'active' AND pinned = 0"
+            " AND provenance = 'ai_inferred' AND created_at_real <= ?",
+            (now - inference_ttl_days * 86400.0,),
+        )
+        archived += cursor.rowcount
+        self._db.commit()
+        return archived
+
     # ----------------------------------------------------------------- admin
 
     def stats(self) -> dict[str, Any]:
@@ -590,3 +818,13 @@ def _reason(breakdown: dict[str, float]) -> str:
     if breakdown["pin"] > 0:
         parts.append("고정됨")
     return ", ".join(parts) or "약한 관련성"
+
+
+def _polarity_of(token: str) -> tuple[int, str] | None:
+    """(pair index, side) when a token carries one of the known polarity stems."""
+    for index, (positive, negative) in enumerate(_POLARITY_PAIRS):
+        if token.startswith(positive):
+            return (index, "a")
+        if token.startswith(negative):
+            return (index, "b")
+    return None

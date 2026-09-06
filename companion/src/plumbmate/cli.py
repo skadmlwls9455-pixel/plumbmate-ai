@@ -78,7 +78,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     commands = (
         "init", "demo", "serve-once", "serve", "show-latest",
-        "token", "listen", "run", "mock-event", "memory-search", "memory-stats",
+        "token", "listen", "run", "mock-event", "memory-search", "memory-stats", "memory-admin",
     )
     for command in commands:
         sub = subparsers.add_parser(command)
@@ -103,12 +103,20 @@ def _main(argv: list[str] | None = None) -> int:
             sub.add_argument("--recall", action="store_true",
                              help="Feed retrieved memories into memory_summary (session-scoped, "
                                   "save scope is NOT verified; off by default)")
-        if command in {"serve-once", "serve", "run", "listen", "memory-search", "memory-stats"}:
+        if command in {"serve-once", "serve", "run", "listen", "memory-search", "memory-stats", "memory-admin"}:
             sub.add_argument("--memory-db", default=None,
                              help="SQLite path (default: <bridge>/state/memory.sqlite3)")
         if command in {"serve-once", "serve", "run", "listen"}:
             sub.add_argument("--no-memory", action="store_true",
                              help="Do not record turns/events into the memory store")
+        if command == "memory-admin":
+            sub.add_argument("action", choices=(
+                "show", "pin", "unpin", "edit", "delete", "purge-deleted", "promote", "consolidate", "archive"))
+            sub.add_argument("--id", type=int, default=None, help="memory_id for show/pin/unpin/edit/delete/promote")
+            sub.add_argument("--summary", default=None, help="edit: replacement text (old row is superseded)")
+            sub.add_argument("--evidence-kind", choices=("player_confirm", "game_event"), default=None)
+            sub.add_argument("--evidence", default=None, help="promote: the confirmation text or game event id")
+            sub.add_argument("--session", default=None, help="consolidate: restrict to one session_id")
         if command == "memory-search":
             sub.add_argument("--query", required=True, help="Free text to score against stored memories")
             sub.add_argument("--session", default=None, help="Restrict to one session_id")
@@ -131,6 +139,48 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "memory-stats":
         with open_memory() as memory:
             print(json.dumps(memory.stats(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "memory-admin":
+        needs_id = args.action in {"show", "pin", "unpin", "edit", "delete", "promote"}
+        if needs_id and args.id is None:
+            print("--id is required for " + args.action)
+            return 2
+        with open_memory() as memory:
+            try:
+                if args.action == "show":
+                    row = memory.get(args.id)
+                    if row is None:
+                        print("no such memory")
+                        return 1
+                    print(json.dumps(row, ensure_ascii=False, indent=2))
+                    for promotion in memory.promotions(args.id):
+                        print("promotion: " + json.dumps(promotion, ensure_ascii=False))
+                elif args.action in {"pin", "unpin"}:
+                    memory.pin(args.id, args.action == "pin")
+                    print(f"{args.action}: {args.id}")
+                elif args.action == "edit":
+                    if not args.summary:
+                        print("--summary is required for edit")
+                        return 2
+                    print(f"superseded {args.id} by {memory.edit(args.id, args.summary)}")
+                elif args.action == "delete":
+                    memory.soft_delete(args.id)
+                    print(f"deleted (soft): {args.id}; run purge-deleted to remove rows physically")
+                elif args.action == "purge-deleted":
+                    print(f"purged: {memory.purge_deleted()}")
+                elif args.action == "promote":
+                    if not (args.evidence_kind and args.evidence):
+                        print("--evidence-kind and --evidence are required for promote")
+                        return 2
+                    memory.promote_to_canon(args.id, args.evidence_kind, args.evidence)
+                    print(f"promoted to canon: {args.id}")
+                elif args.action == "consolidate":
+                    print(f"merged groups: {memory.consolidate(args.session)}")
+                elif args.action == "archive":
+                    print(f"archived: {memory.archive_stale()}")
+            except (KeyError, ValueError) as exc:
+                print("memory-admin: " + str(exc))
+                return 2
         return 0
     if args.command == "memory-search":
         with open_memory() as memory:
