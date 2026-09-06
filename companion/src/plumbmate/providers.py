@@ -33,7 +33,8 @@ DEFAULT_IDEA = "둘이 사진을 찍고 조용한 저녁 데이트를 한다"
 
 def idea_for(request: dict[str, Any]) -> str:
     """The mock's suggestion follows the most pressing motive, if any."""
-    pressing = dominant(assess((request.get("actor") or {}).get("motives")))
+    actor = request.get("actor")
+    pressing = dominant(assess(actor.get("motives") if isinstance(actor, dict) else None))
     return DRIVE_IDEAS[pressing[0]] if pressing else DEFAULT_IDEA
 
 

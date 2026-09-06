@@ -117,6 +117,30 @@ class EngineMemoryTests(unittest.TestCase):
             self.assertLessEqual(summary.count("\n") + 1, 6)
 
 
+class OverrunningStore(MemoryStore):
+    def recall_summary(self, request):
+        return "가" * 1601
+
+
+class RecallContractTests(unittest.TestCase):
+    def test_a_summary_over_the_contract_is_dropped_not_fatal(self):
+        temporary = tempfile.mkdtemp(prefix="plumbmate-overrun-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(temporary, True))
+        paths = BridgePaths(Path(temporary) / "bridge")
+        paths.ensure()
+        store = OverrunningStore(paths.state / "memory.sqlite3")
+        self.addCleanup(store.close)
+        engine = CompanionEngine(paths, MockProvider(), memory=store, recall=True)
+        turn = {
+            "protocol_version": PROTOCOL_VERSION, "request_id": uuid.uuid4().hex, "kind": "turn",
+            "created_at": "2026-09-06T00:00:00+00:00", "player_message": "안녕",
+            "session_id": "household-1", "actor": {"sim_id": 1, "name": "케이트"},
+        }
+        atomic_write_json(paths.requests / f"{turn['request_id']}.json", turn)
+        self.assertIsNotNone(engine.process_one())
+        self.assertEqual((engine.rejected_requests, engine.memory_errors, engine.last_recall_lines), (0, 1, 0))
+
+
 class DriveStateTests(unittest.TestCase):
     """The companion's needs reach the provider as one bounded line and change
     the mock's suggestion — the Phase 2a acceptance test."""

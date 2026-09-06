@@ -17,10 +17,10 @@ import uuid
 import services
 import sims4.commands
 try:
-    import sims4.resources
+    import sims4.resources as _sims4_resources
     _RESOURCES_ERROR = None
 except Exception as _exc:  # the statistic manager is optional for a snapshot
-    sims4.resources = None
+    _sims4_resources = None
     _RESOURCES_ERROR = "{}: {}".format(type(_exc).__name__, _exc)
 try:
     import plumbmate_turn_bridge
@@ -128,13 +128,18 @@ _MOTIVE_TYPES = None
 
 
 def _motive_types():
-    """Resolve motive statistic tunings once; empty when the manager is absent."""
+    """Resolve motive statistic tunings once they are available.
+
+    Only a non-empty result is cached: the manager may not be populated yet
+    when the first snapshot runs, and caching that miss would leave motives
+    absent for the whole game session.
+    """
     global _MOTIVE_TYPES
-    if _MOTIVE_TYPES is not None:
+    if _MOTIVE_TYPES:
         return _MOTIVE_TYPES
     resolved = {}
     try:
-        manager = services.get_instance_manager(sims4.resources.Types.STATISTIC)
+        manager = services.get_instance_manager(_sims4_resources.Types.STATISTIC)
         by_name = {}
         for tuning in manager.types.values():
             by_name[getattr(tuning, "__name__", "")] = tuning
@@ -143,7 +148,8 @@ def _motive_types():
                 resolved[key] = by_name[tuning_name]
     except Exception:
         resolved = {}
-    _MOTIVE_TYPES = resolved
+    if resolved:
+        _MOTIVE_TYPES = resolved
     return resolved
 
 
@@ -161,6 +167,8 @@ def _motives(sim):
                     continue
                 value = float(statistic.get_value())
             except Exception:
+                continue
+            if value != value:  # NaN would clamp to +100 and read as no need
                 continue
             levels[key] = max(-100.0, min(100.0, value))
     except Exception:
@@ -461,8 +469,13 @@ def plumbmate_bridge_ping(_connection=None):
     payload = {"source": "cheat_console"}
     sim = _active_sim(_connection)
     if sim is not None:
-        # The companion scopes memories by this id; events without it are audit-only.
-        payload["session_id"] = "household-{}".format(getattr(getattr(sim, "household", None), "id", "local"))
+        # Audit metadata only: heartbeats are never stored as memories, and a
+        # household id cannot authorize cross-save memory reuse (see _write_request).
+        try:
+            household_id = getattr(getattr(sim, "household", None), "id", "local")
+        except Exception:  # properties can raise during zone/household transitions
+            household_id = "local"
+        payload["session_id"] = "household-{}".format(household_id)
     event_id = TICK_DRIVER.client.queue_event("heartbeat", payload)
     output("queued heartbeat: {}".format(event_id or "outbox full"))
 

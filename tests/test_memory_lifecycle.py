@@ -164,6 +164,27 @@ class EditAndDeleteTests(LifecycleHarness):
         with self.assertRaises(ValueError):
             self.store.edit(old, "다시 고칠 수 없다")
 
+    def test_edit_keeps_the_recall_history_that_protects_from_archiving(self):
+        row = self.store.add_memory(SESSION, "episodic", "케이트와 산책했다", importance=1)
+        self.store.recall(request("케이트 산책"))
+        self.clock.advance(100 * DAY)
+        fixed = self.store.edit(row, "케이트와 공원에서 산책했다")
+        self.assertEqual(self.store.get(fixed)["recall_count"], 1)
+        self.assertEqual(self.store.archive_stale(), 0)
+        self.assertEqual(self.status(fixed), "active")
+
+    def test_purging_a_referenced_row_unlinks_instead_of_failing(self):
+        old = self.store.add_memory(SESSION, "canon", "에이든은 고소공포증이 있다", provenance="player_canon")
+        new = self.store.edit(old, "에이든은 고소공포증을 극복했다")
+        self.store.soft_delete(new)
+        self.assertEqual(self.store.purge_deleted(), 1)
+        self.assertIsNone(self.store.get(new))
+        self.assertEqual((self.status(old), self.store.get(old)["superseded_by"]), ("superseded", None))
+        if self.store.fts_available:
+            reused = self.store.add_memory(SESSION, "episodic", "전혀 다른 기억")
+            self.assertEqual(reused, new, "sqlite reuses the rowid")
+            self.assertNotIn(reused, [r.memory_id for r in self.store.search("고소공포증 극복")])
+
     def test_soft_delete_hides_and_purge_removes(self):
         row = self.store.add_memory(SESSION, "episodic", "지워질 기억")
         self.store.soft_delete(row)
@@ -193,6 +214,31 @@ class DisputeAndPromotionTests(LifecycleHarness):
         other = self.store.add_memory(SESSION, "sentiment", "베라는 낚시를 좋아한다",
                                       provenance="ai_inferred", confidence=0.6)
         self.assertEqual(self.status(other), "active")
+
+    def test_polarity_heuristic_handles_negation_and_ignores_prefix_words(self):
+        canon = self.store.add_memory(SESSION, "canon", "베라는 매운 음식을 좋아한다", provenance="player_canon")
+        flipped = self.store.add_memory(SESSION, "sentiment", "베라는 매운 음식을 좋아하지 않는다",
+                                        provenance="ai_inferred", confidence=0.6)
+        self.assertEqual(self.status(flipped), "disputed")
+        agreeing = self.store.add_memory(SESSION, "sentiment", "베라는 매운 음식을 좋아하지만 단 것은 싫어한다",
+                                         provenance="ai_inferred", confidence=0.6)
+        self.assertEqual(self.status(agreeing), "active", "an inference carrying both sides is not a contradiction")
+        self.store.add_memory(SESSION, "canon", "kate plays good tennis", provenance="player_canon")
+        badminton = self.store.add_memory(SESSION, "sentiment", "kate plays tennis and badminton",
+                                          provenance="ai_inferred", confidence=0.6)
+        self.assertEqual(self.status(badminton), "active", "'bad' inside a word is not a polarity")
+        self.assertEqual(self.store.get(flipped)["details"], f" [disputes canon #{canon}]")
+
+    def test_promoting_a_disputed_guess_replaces_the_canon_it_disputed(self):
+        canon = self.store.add_memory(SESSION, "canon", "베라는 매운 음식을 싫어한다", provenance="player_canon")
+        guess = self.store.add_memory(SESSION, "sentiment", "베라는 매운 음식을 좋아한다",
+                                      provenance="ai_inferred", confidence=0.6)
+        self.store.promote_to_canon(guess, "player_confirm", "맞아, 베라는 매운 걸 좋아해")
+        self.assertEqual((self.status(canon), self.store.get(canon)["superseded_by"]), ("superseded", guess))
+        self.assertIsNone(self.store.get(guess)["details"])
+        recalled = self.recalled_ids("베라 매운 음식")
+        self.assertIn(guess, recalled)
+        self.assertNotIn(canon, recalled)
 
     def test_promotion_needs_evidence_and_is_recorded(self):
         # RFC-001 T12

@@ -17,7 +17,7 @@ from .protocol import (
     validate_response,
 )
 from .drives import describe as describe_drives
-from .memory import MemoryStore
+from .memory import MAX_SUMMARY_CHARS, MemoryStore
 from .reflection import maintain
 from .providers import Provider
 from .turn_status import write_turn_status
@@ -46,8 +46,9 @@ class CompanionEngine:
         self.memory_errors = 0
         self.last_recall_lines = 0
         # Between-turns cognition (merge, archive, summaries, reflection)
-        # runs after every N completed turns; 0 disables it. It is rule-based
-        # and touches only SQLite, so it costs no model attempt.
+        # runs once the store has counted N completed turns since the last
+        # run; 0 disables it. The counter is persisted, so short serve-once
+        # sessions add up. Rule-based and SQLite-only: no model attempt.
         self.maintenance_every = max(0, int(maintenance_every))
         self.completed_turns = 0
         self.maintenance_runs = 0
@@ -84,7 +85,13 @@ class CompanionEngine:
                 request["state_delta"] = {}
                 if self.recall_enabled:
                     summary = self._memory_call(self.memory.recall_summary, request)
-                    request["memory_summary"] = summary or ""
+                    if not isinstance(summary, str) or len(summary) > MAX_SUMMARY_CHARS:
+                        # A store that overruns the contract is a memory
+                        # failure, not an invalid request: drop it, count it.
+                        if summary is not None:
+                            self.memory_errors += 1
+                        summary = ""
+                    request["memory_summary"] = summary
                     self.last_recall_lines = summary.count("\n") + 1 if summary else 0
                 actor = request.get("actor") or {}
                 state = describe_drives(actor.get("motives"), actor.get("buffs"), actor.get("mood"))
@@ -126,7 +133,8 @@ class CompanionEngine:
             self.completed_turns += 1
             if self.memory is not None:
                 self._memory_call(self.memory.remember_turn_response, request, response)
-                if self.maintenance_every and self.completed_turns % self.maintenance_every == 0:
+                counted = self._memory_call(self.memory.note_turn)
+                if self.maintenance_every and counted is not None and counted >= self.maintenance_every:
                     outcome = self._memory_call(maintain, self.memory, request.get("session_id"))
                     if outcome is not None:
                         self.maintenance_runs += 1

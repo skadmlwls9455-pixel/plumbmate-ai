@@ -5,6 +5,7 @@ the Phase 1 slice. No model, no game, no network. A fake clock drives recency.
 """
 
 import sqlite3
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -223,6 +224,33 @@ class FallbackTests(unittest.TestCase):
         recalled = store.recall(request("불난 거 기억나?"))
         self.assertTrue(recalled)
         self.assertIsInstance(recalled[0], Recalled)
+
+
+class OddInputTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.mkdtemp(prefix="plumbmate-odd-")
+        self.addCleanup(lambda: shutil.rmtree(temporary, True))
+        self.store = MemoryStore(Path(temporary) / "memory.sqlite3")
+        self.addCleanup(self.store.close)
+
+    def test_non_string_request_fields_are_not_stored_as_garbage(self):
+        turn = {"session_id": "household-1", "player_message": None, "actor": "not-a-dict",
+                "recent_events": "불이 났다"}
+        self.assertEqual(self.store.remember_turn_request(turn), [])
+        self.assertIsNone(self.store.remember_turn_response(turn, {"partner_message": None}))
+        self.assertEqual(self.store.rows_of("household-1"), [])
+
+    def test_odd_event_payloads_are_stored_for_audit_without_raising(self):
+        self.assertIsNotNone(self.store.remember_event("custom", ["a", 1]))
+        self.assertIsNotNone(self.store.remember_event("custom", {1: b"bytes", "k": {2, 3}}))
+        self.assertIsNotNone(self.store.remember_event("custom", "just text"))
+        self.assertEqual(len(self.store.rows_of("unscoped")), 3)
+
+    def test_a_huge_query_is_bounded(self):
+        turn = {"session_id": "household-1", "request_id": "x", "player_message": " ".join(f"단어{i}" for i in range(5000)),
+                "actor": {"sim_id": 1, "name": "케이트"}}
+        self.store.add_memory("household-1", "episodic", "단어1 이야기")
+        self.assertEqual([r.memory_id for r in self.store.recall(turn)], [1])
 
 
 if __name__ == "__main__":

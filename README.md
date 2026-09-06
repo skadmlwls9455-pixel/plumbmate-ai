@@ -107,8 +107,9 @@ one gate from `ai_inferred` to canon (logged in `canon_promotions`; without
 evidence it is refused). An inference that flips a canon fact on the same
 subject lands as `disputed` and is never recalled.
 
-Between turns the engine runs a rule-based batch (every 20 completed turns by
-default, or `memory-admin maintain` by hand):
+Between turns the engine runs a rule-based batch (once the store has counted
+20 completed turns since the last run; the counter is persisted so short
+`serve-once` sessions add up; or `memory-admin maintain` by hand):
 
 - `consolidate` folds three or more identical observations within three days
   into one "N회 반복" row; `archive` retires trivial rows nobody recalled in 90

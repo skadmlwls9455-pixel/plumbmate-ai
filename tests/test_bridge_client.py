@@ -489,6 +489,13 @@ class AckDeadlineTests(unittest.TestCase):
 class AdoptOutboxTests(unittest.TestCase):
     """A replacement client takes over the old client's unsent events."""
 
+    def test_adopting_from_itself_is_a_no_op(self):
+        client = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(client.close)
+        client.queue_event("heartbeat", {})
+        self.assertEqual(client.adopt_outbox(client), 0)
+        self.assertEqual(client.queued, 1)
+
     def test_unsent_events_move_to_the_replacement(self):
         old = bridge.BridgeClient(TOKEN, closed_port())
         new = bridge.BridgeClient(TOKEN, closed_port())

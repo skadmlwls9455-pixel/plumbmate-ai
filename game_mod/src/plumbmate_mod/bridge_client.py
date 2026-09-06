@@ -237,6 +237,8 @@ class BridgeClient(object):
         with the discarded object. Entries that do not fit stay on ``other``
         and are counted as rejected here.
         """
+        if other is self:
+            return 0
         adopted = 0
         while other._outbox and len(self._outbox) < self._max_outbox:
             self._outbox.append(other._outbox.pop(0))

@@ -80,11 +80,12 @@ class RelationshipSummaryTests(Harness):
         self.assertIn("케이트↔에이든", row["summary"])
         self.assertIn("기억 6건", row["summary"])
         self.assertIsNotNone(row["source_ids"])
-        # While the six raw lines are fresh they outrank their own summary;
-        # after the episodic half-life has passed twice the summary (30-day
-        # half-life) takes over, labeled as the companion's own reading.
+        # The summary takes at most one of the six slots (type cap) while the
+        # raw lines are fresh, and keeps its place as they decay (30-day
+        # half-life against 7), labeled as the companion's own reading.
         fresh = self.store.recall(request("낚시 어땠어?"))
-        self.assertNotIn(created[0], [r.memory_id for r in fresh])
+        self.assertEqual(sum(1 for r in fresh if r.memory_type == "relationship_summary"), 1)
+        self.assertEqual(len(fresh), 6)
         self.clock.advance(14 * DAY)
         recalled = self.store.recall(request("낚시 어땠어?"))
         chosen = [r for r in recalled if r.memory_type == "relationship_summary"]
@@ -176,8 +177,38 @@ class ReflectionTests(Harness):
         created = reflect(self.store, SESSION, max_lines=2)
         self.assertEqual(len(created), 2)
         texts = [self.store.get(i)["summary"] for i in created]
-        self.assertIn("4일째 열려 있다", texts[0])
+        self.assertIn("며칠째 열려 있다", texts[0])
         self.assertIn("보류 중이다", texts[1])
+
+    def test_an_open_promise_yields_one_note_across_daily_runs(self):
+        promise = self.store.add_memory(SESSION, "promise", "주말에 같이 캠핑 가기로 했다", status="open",
+                                        trigger_keywords=["캠핑"])
+        self.clock.advance(4 * DAY)
+        first = reflect(self.store, SESSION)
+        self.assertEqual(len(first), 1)
+        for _ in range(6):
+            self.clock.advance(DAY)
+            self.assertEqual(reflect(self.store, SESSION), [])
+        notes = [r for r in self.store.rows_of(SESSION, event_kind="reflection") if r["status"] == "active"]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(self.store.active_note(SESSION, "open_promise", [promise]), first[0])
+        recalled = self.store.recall(request("캠핑 언제 가?"))
+        self.assertEqual(sum(1 for r in recalled if r.memory_id in first), 1)
+
+    def test_regeneration_sees_new_evidence_beyond_the_highlight_sample(self):
+        kate = self.store.ensure_entity("sim", "1", "케이트")
+        aiden = self.store.ensure_entity("sim", "2", "에이든")
+        for index in range(10):
+            self.store.add_memory(SESSION, "episodic", f"큰 사건 {index}", importance=7,
+                                  entities={kate: "actor", aiden: "target"})
+        first = refresh_relationship_summaries(self.store, SESSION)[0]
+        self.clock.advance(8 * DAY)
+        for line in ("오늘 산책했어", "저녁 같이 먹자"):
+            self.chat(line)
+        second = refresh_relationship_summaries(self.store, SESSION)
+        self.assertEqual(len(second), 1, "new low-importance chat is still new evidence")
+        self.assertEqual(self.store.get(first)["status"], "superseded")
+        self.assertIn("기억 14건", self.store.get(second[0])["summary"])
 
     def test_reflection_is_idempotent_within_the_window(self):
         self.store.recall(request("우리 처음 만난 공원 기억나?"))
@@ -246,10 +277,51 @@ class MaintainTests(Harness):
         notes = store.rows_of(SESSION, event_kind="reflection")
         self.assertEqual(len(notes), 1)
 
+    def test_maintenance_counter_persists_across_processes(self):
+        paths = bridge_from(self.root / "bridge")
+        paths.ensure()
+        store = MemoryStore(paths.state / "memory.sqlite3")
+        self.addCleanup(store.close)
+
+        def one_turn(engine, message):
+            turn = request(message)
+            atomic_write_json(paths.requests / f"{turn['request_id']}.json", turn)
+            self.assertIsNotNone(engine.process_one())
+
+        one_turn(CompanionEngine(paths, MockProvider(), memory=store, maintenance_every=3), "첫 번째")
+        one_turn(CompanionEngine(paths, MockProvider(), memory=store, maintenance_every=3), "두 번째")
+        self.assertEqual(store.turns_since_maintenance(), 2)
+        third = CompanionEngine(paths, MockProvider(), memory=store, maintenance_every=3)
+        one_turn(third, "세 번째")
+        self.assertEqual((third.completed_turns, third.maintenance_runs), (1, 1))
+        self.assertEqual(store.turns_since_maintenance(), 0)
+
+    def test_a_failing_maintenance_never_fails_the_turn(self):
+        from unittest import mock
+        paths = bridge_from(self.root / "bridge")
+        paths.ensure()
+        store = MemoryStore(paths.state / "memory.sqlite3")
+        self.addCleanup(store.close)
+        engine = CompanionEngine(paths, MockProvider(), memory=store, maintenance_every=1)
+        turn = request("안녕")
+        atomic_write_json(paths.requests / f"{turn['request_id']}.json", turn)
+        with mock.patch("plumbmate.engine.maintain", side_effect=RuntimeError("disk full")):
+            self.assertIsNotNone(engine.process_one())
+        self.assertEqual((engine.maintenance_runs, engine.memory_errors), (0, 1))
+        self.assertTrue((paths.responses / f"{turn['request_id']}.json").exists())
+
     def test_engine_default_and_disabled_maintenance(self):
         paths = bridge_from(self.root / "bridge")
         self.assertEqual(CompanionEngine(paths, MockProvider()).maintenance_every, 20)
         self.assertEqual(CompanionEngine(paths, MockProvider(), maintenance_every=-3).maintenance_every, 0)
+
+    def test_a_broken_store_file_does_not_stop_serving(self):
+        bridge = self.root / "bridge"
+        bridge.mkdir()
+        broken = self.root / "not-a-database.sqlite3"
+        broken.write_text("this is not sqlite")
+        self.assertEqual(cli_main(["serve-once", "--bridge", str(bridge), "--memory-db", str(broken)]), 0)
+        self.assertEqual(cli_main(["memory-stats", "--bridge", str(bridge), "--memory-db", str(broken)]), 2)
 
     def test_admin_cli_actions(self):
         bridge = self.root / "bridge"

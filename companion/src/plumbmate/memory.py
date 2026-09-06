@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ UNSCOPED_SESSION = "unscoped"
 MAX_SUMMARY_CHARS = 1600   # request schema: memory_summary maxLength
 MAX_LINE_CHARS = 240
 MAX_CANDIDATES = 50
+MAX_QUERY_TOKENS = 64
 LOGGED_CANDIDATES = 20
 
 # Default importance per event kind (RFC-001 §7). Heartbeats are transport
@@ -73,9 +75,20 @@ DERIVED_KINDS = frozenset(("reflection", "relationship_summary"))
 EVIDENCE_KINDS = ("player_confirm", "game_event")
 # Contradiction heuristic for ai_inferred rows: high keyword overlap with a
 # canon row plus an opposing polarity token. Deliberately narrow — it must
-# never quarantine a merely *different* inference.
-_POLARITY_PAIRS = (("좋아", "싫어"), ("있다", "없다"), ("한다", "않는다"), ("맞다", "틀리다"),
-                   ("good", "bad"), ("likes", "dislikes"), ("true", "false"))
+# never quarantine a merely *different* inference. Korean stems match by
+# prefix (inflection), English words match whole; a following 않-token flips
+# the last polarity seen ("좋아하지 않는다" reads as dislike). The 1-character
+# negation 안 is dropped by the tokenizer and is a known miss (RFC-001 F2).
+_POLARITY_PAIRS = (
+    (("좋아", "사랑"), ("싫어", "미워"), "prefix"),
+    (("있다", "있어", "있는"), ("없다", "없어", "없는"), "prefix"),
+    (("맞다", "맞아"), ("틀리", "틀렸"), "prefix"),
+    (("good",), ("bad",), "word"),
+    (("likes", "like", "loves", "love"), ("dislikes", "dislike", "hates", "hate"), "word"),
+    (("true",), ("false",), "word"),
+)
+_NEGATION_PREFIXES = ("않",)
+INFERRED_PREFIX = "[에이든의 추측] "
 
 ROLE_WEIGHTS = {"actor": 1.0, "target": 1.0, "witness": 0.6, "mentioned": 0.4, "location": 0.5}
 # Per-turn caps keep one type from crowding the others out. Episodic rows are
@@ -137,6 +150,7 @@ CREATE TABLE IF NOT EXISTS memories (
   last_recalled_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories(session_id, status, memory_type);
+CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(session_id, created_at_real);
 CREATE TABLE IF NOT EXISTS memory_entities (
   memory_id INTEGER NOT NULL REFERENCES memories(memory_id),
   entity_id INTEGER NOT NULL REFERENCES entities(entity_id),
@@ -168,6 +182,10 @@ CREATE TABLE IF NOT EXISTS canon_promotions (
   evidence_kind  TEXT NOT NULL CHECK (evidence_kind IN ('player_confirm','game_event')),
   evidence_ref   TEXT NOT NULL,
   promoted_at    REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS retrieval_config (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -322,12 +340,15 @@ class MemoryStore:
         pinned: bool = False,
         created_at: float | None = None,
         source_ids: list[int] | None = None,
+        commit: bool = True,
     ) -> int:
         if memory_type not in MEMORY_TYPES:
             raise ValueError("Unknown memory type: " + memory_type)
         if provenance not in PROVENANCES:
             raise ValueError("Unknown provenance: " + provenance)
-        summary = clip(summary, MAX_LINE_CHARS)
+        # The recall line carries a prefix for inferences; keep the whole
+        # line within the per-line budget so packing never truncates it.
+        summary = clip(summary, MAX_LINE_CHARS - (len(INFERRED_PREFIX) if provenance == "ai_inferred" else 0))
         if not summary:
             raise ValueError("A memory needs a summary")
         keywords = tokenize(summary + " " + (details or ""))
@@ -364,28 +385,34 @@ class MemoryStore:
                     "UPDATE memories SET status = 'disputed', details = COALESCE(details, '') || ? WHERE memory_id = ?",
                     (f" [disputes canon #{conflict}]", memory_id),
                 )
-        self._db.commit()
+        if commit:
+            self._db.commit()
         return memory_id
 
     def _contradicts_canon(self, session_id: str, keywords: list[str]) -> int | None:
         """Return the canon memory_id an inference contradicts, if the
-        heuristic fires: ≥60% of the canon row's keywords appear in the
-        inference AND the two carry opposite polarity tokens."""
+        heuristic fires: ≥60% of the canon row's content keywords appear in
+        the inference AND the two carry opposite polarity on the same pair.
+        An inference that carries both sides itself is left alone."""
         tokens = set(keywords)
+        polarity_new = _polarities(keywords)
+        if not polarity_new or _two_sided(polarity_new):
+            return None
         rows = self._db.execute(
             "SELECT memory_id, keywords FROM memories WHERE session_id = ? AND memory_type = 'canon'"
             " AND status = 'active'", (session_id,),
         ).fetchall()
         for row in rows:
-            canon_tokens = set(row["keywords"].split())
-            if not canon_tokens:
+            canon_keywords = row["keywords"].split()
+            content = {t for t in canon_keywords if _polarity_of(t) is None and not t.startswith(_NEGATION_PREFIXES)}
+            if not content:
                 continue
-            content_a = {t for t in canon_tokens if not _polarity_of(t)}
-            overlap = len(content_a & tokens) / max(1, len(content_a))
+            overlap = len(content & tokens) / len(content)
             if overlap < 0.6:
                 continue
-            polarity_canon = {_polarity_of(t) for t in canon_tokens} - {None}
-            polarity_new = {_polarity_of(t) for t in tokens} - {None}
+            polarity_canon = _polarities(canon_keywords)
+            if _two_sided(polarity_canon):
+                continue
             if any((pair, "a") in polarity_canon and (pair, "b") in polarity_new
                    or (pair, "b") in polarity_canon and (pair, "a") in polarity_new
                    for pair in range(len(_POLARITY_PAIRS))):
@@ -397,17 +424,19 @@ class MemoryStore:
         the adapter reported with the turn. Returns the new memory ids."""
         session_id = str(request.get("session_id") or UNSCOPED_SESSION)
         entities = self._request_entities(request)
-        actor_name = clip(str((request.get("actor") or {}).get("name", "플레이어")), 64)
+        actor = request.get("actor")
+        actor_name = clip(str(actor.get("name") or "플레이어") if isinstance(actor, dict) else "플레이어", 64)
         created: list[int] = []
-        message = clip(str(request.get("player_message", "")), 200)
+        message = clip(str(request.get("player_message") or ""), 200)
         if message:
             created.append(self.add_memory(
                 session_id, "episodic", f"{actor_name}: {message}",
                 provenance="bridge_observed", importance=IMPORTANCE_BY_EVENT_KIND["chat_turn"],
                 event_kind="chat_turn", entities=entities,
             ))
-        for event in request.get("recent_events") or []:
-            text = clip(str(event), MAX_LINE_CHARS)
+        events = request.get("recent_events")
+        for event in (events if isinstance(events, list) else []):
+            text = clip(str(event or ""), MAX_LINE_CHARS)
             if not text or self._has_recent_duplicate(session_id, text):
                 continue
             created.append(self.add_memory(
@@ -418,7 +447,7 @@ class MemoryStore:
 
     def remember_turn_response(self, request: dict[str, Any], response: dict[str, Any]) -> int | None:
         session_id = str(request.get("session_id") or UNSCOPED_SESSION)
-        message = clip(str(response.get("partner_message", "")), 200)
+        message = clip(str(response.get("partner_message") or ""), 200)
         if not message:
             return None
         entities = self._request_entities(request)
@@ -435,15 +464,15 @@ class MemoryStore:
         unscoped rows are never recalled — only kept for audit."""
         if kind in SKIPPED_EVENT_KINDS:
             return None
-        payload = dict(payload or {})
+        payload = dict(payload) if isinstance(payload, dict) else ({"value": payload} if payload is not None else {})
         scope = str(session_id or payload.get("session_id") or UNSCOPED_SESSION)
         entities: dict[int, str] = {}
         if "sim_id" in payload:
             entities[self.ensure_entity("sim", str(payload["sim_id"]), str(payload.get("name", "")))] = "actor"
         if "target_sim_id" in payload:
             entities[self.ensure_entity("sim", str(payload["target_sim_id"]), str(payload.get("target_name", "")))] = "target"
-        detail = json.dumps({k: v for k, v in payload.items() if k != "session_id"},
-                            ensure_ascii=False, sort_keys=True)
+        detail = json.dumps({str(k): v for k, v in payload.items() if k != "session_id"},
+                            ensure_ascii=False, sort_keys=True, default=str)
         summary = clip(f"{kind}: {detail}" if detail != "{}" else kind, MAX_LINE_CHARS)
         return self.add_memory(
             scope, "episodic", summary, provenance="game_observed",
@@ -466,7 +495,7 @@ class MemoryStore:
             return []
         query_text = " ".join([str(request.get("player_message", ""))]
                               + [str(item) for item in request.get("recent_events") or []])
-        tokens = tokenize(query_text)
+        tokens = tokenize(query_text)[:MAX_QUERY_TOKENS]
         present = self._request_entities(request)
         scored = self._score_candidates(session_id, tokens, present)
         # The adapter repeats recent_events on every turn; the rows they
@@ -555,11 +584,12 @@ class MemoryStore:
             f"SELECT * FROM memories WHERE memory_id IN ({placeholders})", tuple(candidate_ids),
         ).fetchall()
         now = self._now()
+        overlap = self._entity_overlaps([int(row["memory_id"]) for row in rows], present)
         scored: list[Recalled] = []
         for row in rows:
             memory_id = int(row["memory_id"])
             kw = keyword.get(memory_id, 0.0)
-            ent = self._entity_overlap(memory_id, present)
+            ent = overlap.get(memory_id, 0.0)
             imp = row["importance"] / 10.0
             rec = self._recency(row, now)
             open_score = 0.0
@@ -586,15 +616,26 @@ class MemoryStore:
         scored.sort(key=lambda item: (-item.score, item.memory_id))
         return [item for item in scored if item.score >= floor]
 
-    def _entity_overlap(self, memory_id: int, present: dict[int, str]) -> float:
+    def _entity_overlaps(self, memory_ids: list[int], present: dict[int, str]) -> dict[int, float]:
+        """Per memory: mean role weight of its links to entities in the
+        request, over all its links. A row whose only links are household
+        witnesses scores 0.6, one about the actor 1.0, so 'everyone was
+        there' does not by itself outrank 'this was about you'."""
+        if not memory_ids or not present:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
         rows = self._db.execute(
-            "SELECT entity_id, role FROM memory_entities WHERE memory_id = ?", (memory_id,),
+            f"SELECT memory_id, entity_id, role FROM memory_entities WHERE memory_id IN ({placeholders})",
+            tuple(memory_ids),
         ).fetchall()
-        if not rows or not present:
-            return 0.0
-        total = sum(ROLE_WEIGHTS.get(row["role"], 0.4) for row in rows)
-        matched = sum(ROLE_WEIGHTS.get(row["role"], 0.4) for row in rows if int(row["entity_id"]) in present)
-        return matched / total if total else 0.0
+        links: dict[int, int] = {}
+        matched: dict[int, float] = {}
+        for row in rows:
+            memory_id = int(row["memory_id"])
+            links[memory_id] = links.get(memory_id, 0) + 1
+            if int(row["entity_id"]) in present:
+                matched[memory_id] = matched.get(memory_id, 0.0) + ROLE_WEIGHTS.get(row["role"], 0.4)
+        return {memory_id: min(1.0, matched.get(memory_id, 0.0) / count) for memory_id, count in links.items()}
 
     def _recency(self, row: sqlite3.Row, now: float) -> float:
         if row["memory_type"] == "canon" or (row["memory_type"] == "promise" and row["status"] == "open"):
@@ -663,18 +704,29 @@ class MemoryStore:
             "SELECT entity_id, role FROM memory_entities WHERE memory_id = ?", (memory_id,))}
         # A corrected guess starts over as active and is re-checked against canon.
         status = "active" if old["status"] == "disputed" else old["status"]
-        new_id = self.add_memory(
-            old["session_id"], old["memory_type"], summary,
-            provenance=old["provenance"], importance=old["importance"], confidence=old["confidence"],
-            event_kind=old["event_kind"], status=status, entities=links,
-            details=details if details is not None else old["details"],
-            trigger_keywords=json.loads(old["trigger_keywords"]) if old["trigger_keywords"] else None,
-            pinned=bool(old["pinned"]), created_at=old["created_at_real"],
-        )
-        self._db.execute(
-            "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE memory_id = ?", (new_id, memory_id),
-        )
-        self._db.commit()
+        try:
+            new_id = self.add_memory(
+                old["session_id"], old["memory_type"], summary,
+                provenance=old["provenance"], importance=old["importance"], confidence=old["confidence"],
+                event_kind=old["event_kind"], status=status, entities=links,
+                details=details if details is not None else old["details"],
+                trigger_keywords=json.loads(old["trigger_keywords"]) if old["trigger_keywords"] else None,
+                pinned=bool(old["pinned"]), created_at=old["created_at_real"],
+                source_ids=json.loads(old["source_ids"]) if old["source_ids"] else None, commit=False,
+            )
+            # The correction inherits the recall history, or archive_stale
+            # would retire an old row's fresh correction as never recalled.
+            self._db.execute(
+                "UPDATE memories SET recall_count = ?, last_recalled_at = ? WHERE memory_id = ?",
+                (old["recall_count"], old["last_recalled_at"], new_id),
+            )
+            self._db.execute(
+                "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE memory_id = ?", (new_id, memory_id),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         return new_id
 
     def soft_delete(self, memory_id: int) -> None:
@@ -685,17 +737,29 @@ class MemoryStore:
 
     def purge_deleted(self) -> int:
         """Step two, explicit: physically remove rows already soft-deleted."""
-        ids = [int(r["memory_id"]) for r in self._db.execute("SELECT memory_id FROM memories WHERE status = 'deleted'")]
-        for memory_id in ids:
-            self._db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
-            self._db.execute("DELETE FROM retrieval_log WHERE memory_id = ?", (memory_id,))
-            self._db.execute("DELETE FROM canon_promotions WHERE memory_id = ?", (memory_id,))
-            if self.fts_available:
-                self._db.execute("INSERT INTO memories_fts (memories_fts, rowid, summary, keywords) VALUES ('delete', ?, '', '')",
-                                 (memory_id,))
-            self._db.execute("DELETE FROM memories WHERE memory_id = ?", (memory_id,))
-        self._db.commit()
-        return len(ids)
+        rows = self._db.execute(
+            "SELECT memory_id, summary, keywords FROM memories WHERE status = 'deleted'").fetchall()
+        try:
+            for row in rows:
+                memory_id = int(row["memory_id"])
+                # Rows that pointed here keep their status but lose the dangling link.
+                self._db.execute("UPDATE memories SET merged_into = NULL WHERE merged_into = ?", (memory_id,))
+                self._db.execute("UPDATE memories SET superseded_by = NULL WHERE superseded_by = ?", (memory_id,))
+                self._db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+                self._db.execute("DELETE FROM retrieval_log WHERE memory_id = ?", (memory_id,))
+                self._db.execute("DELETE FROM canon_promotions WHERE memory_id = ?", (memory_id,))
+                if self.fts_available:
+                    # A contentless table needs the original values to drop its postings.
+                    self._db.execute(
+                        "INSERT INTO memories_fts (memories_fts, rowid, summary, keywords) VALUES ('delete', ?, ?, ?)",
+                        (memory_id, row["summary"], row["keywords"]),
+                    )
+                self._db.execute("DELETE FROM memories WHERE memory_id = ?", (memory_id,))
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return len(rows)
 
     def promote_to_canon(self, memory_id: int, evidence_kind: str, evidence_ref: str) -> None:
         """The single gate through which an inference may become canon.
@@ -721,6 +785,19 @@ class MemoryStore:
             "UPDATE memories SET provenance = 'player_canon', confidence = 1.0, memory_type = 'canon',"
             " status = 'active' WHERE memory_id = ?", (memory_id,),
         )
+        # A confirmed guess that disputed a canon row replaces it: two active
+        # canon rows contradicting each other would be the worse outcome.
+        marker = re.search(r" \[disputes canon #(\d+)\]", row["details"] or "")
+        if marker:
+            older = int(marker.group(1))
+            self._db.execute(
+                "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE memory_id = ? AND status = 'active'",
+                (memory_id, older),
+            )
+            self._db.execute(
+                "UPDATE memories SET details = NULLIF(REPLACE(details, ?, ''), '') WHERE memory_id = ?",
+                (marker.group(0), memory_id),
+            )
         self._db.commit()
 
     def promotions(self, memory_id: int | None = None) -> list[dict[str, Any]]:
@@ -741,17 +818,17 @@ class MemoryStore:
         turns are never merged (each is distinct content), nor are pinned or
         ai_inferred rows.
         """
+        excluded = ",".join("?" for _ in UNMERGEABLE_EVENT_KINDS)
         rows = self._db.execute(
             "SELECT memory_id, session_id, event_kind, summary, provenance, importance, created_at_real"
             " FROM memories WHERE status = 'active' AND memory_type = 'episodic' AND pinned = 0"
             " AND provenance != 'ai_inferred' AND event_kind IS NOT NULL AND merged_into IS NULL"
-            " AND source_ids IS NULL AND (? IS NULL OR session_id = ?) ORDER BY created_at_real",
-            (session_id, session_id),
+            f" AND source_ids IS NULL AND event_kind NOT IN ({excluded})"
+            " AND (? IS NULL OR session_id = ?) ORDER BY created_at_real",
+            (*UNMERGEABLE_EVENT_KINDS, session_id, session_id),
         ).fetchall()
         groups: dict[tuple, list[sqlite3.Row]] = {}
         for row in rows:
-            if row["event_kind"] in UNMERGEABLE_EVENT_KINDS:
-                continue
             groups.setdefault((row["session_id"], row["event_kind"], row["summary"]), []).append(row)
         merged_groups = 0
         window = window_days * 86400.0
@@ -775,16 +852,20 @@ class MemoryStore:
         placeholders = ",".join("?" for _ in ids)
         for r in self._db.execute(f"SELECT entity_id, role FROM memory_entities WHERE memory_id IN ({placeholders})", ids):
             links.setdefault(int(r["entity_id"]), r["role"])
-        new_id = self.add_memory(
-            scope, "episodic", f"{summary} — {len(batch)}회 반복", provenance=provenance,
-            importance=max(int(r["importance"]) for r in batch), event_kind=kind, entities=links,
-            created_at=float(batch[-1]["created_at_real"]), source_ids=ids,
-        )
-        self._db.execute(
-            f"UPDATE memories SET status = 'merged', merged_into = ? WHERE memory_id IN ({placeholders})",
-            (new_id, *ids),
-        )
-        self._db.commit()
+        try:
+            new_id = self.add_memory(
+                scope, "episodic", f"{summary} — {len(batch)}회 반복", provenance=provenance,
+                importance=max(int(r["importance"]) for r in batch), event_kind=kind, entities=links,
+                created_at=float(batch[-1]["created_at_real"]), source_ids=ids, commit=False,
+            )
+            self._db.execute(
+                f"UPDATE memories SET status = 'merged', merged_into = ? WHERE memory_id IN ({placeholders})",
+                (new_id, *ids),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         return new_id
 
     def archive_stale(self, *, after_days: float = ARCHIVE_AFTER_DAYS,
@@ -811,6 +892,27 @@ class MemoryStore:
 
     # ------------------------------------------------- batch cognition input
 
+    def note_turn(self) -> int:
+        """Count one completed turn toward the next maintenance run. The
+        counter lives in the store, so short-lived processes add up."""
+        self._db.execute(
+            "INSERT INTO meta (key, value) VALUES ('turns_since_maintenance', '1')"
+            " ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+        )
+        self._db.commit()
+        return self.turns_since_maintenance()
+
+    def turns_since_maintenance(self) -> int:
+        row = self._db.execute("SELECT value FROM meta WHERE key = 'turns_since_maintenance'").fetchone()
+        try:
+            return int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def reset_turn_counter(self) -> None:
+        self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('turns_since_maintenance', '0')")
+        self._db.commit()
+
     def sessions(self) -> list[str]:
         """Session ids with recallable rows; the unscoped audit bucket is excluded."""
         rows = self._db.execute(
@@ -821,6 +923,15 @@ class MemoryStore:
 
     def recently_stored(self, session_id: str, summary: str, window_days: float = 7.0) -> bool:
         return self._has_recent_duplicate(session_id, clip(summary, MAX_LINE_CHARS), window_days * 86400.0)
+
+    def active_note(self, session_id: str, kind: str, source_ids: list[int]) -> int | None:
+        """The active reflection note already covering these sources, if any."""
+        row = self._db.execute(
+            "SELECT memory_id FROM memories WHERE session_id = ? AND event_kind = 'reflection'"
+            " AND status = 'active' AND details = ? AND source_ids = ? LIMIT 1",
+            (session_id, kind, json.dumps([int(i) for i in source_ids])),
+        ).fetchone()
+        return int(row["memory_id"]) if row is not None else None
 
     def missed_turns(self, session_id: str, since: float) -> list[dict[str, Any]]:
         """Turns where recall ran and nothing was selected (the retrieval gap
@@ -940,10 +1051,34 @@ def _reason(breakdown: dict[str, float], event_kind: str | None = None) -> str:
 
 
 def _polarity_of(token: str) -> tuple[int, str] | None:
-    """(pair index, side) when a token carries one of the known polarity stems."""
-    for index, (positive, negative) in enumerate(_POLARITY_PAIRS):
-        if token.startswith(positive):
-            return (index, "a")
-        if token.startswith(negative):
-            return (index, "b")
+    """(pair index, side) when a token carries one of the known polarity forms."""
+    for index, (positive, negative, mode) in enumerate(_POLARITY_PAIRS):
+        if mode == "prefix":
+            if token.startswith(positive):
+                return (index, "a")
+            if token.startswith(negative):
+                return (index, "b")
+        else:
+            if token in positive:
+                return (index, "a")
+            if token in negative:
+                return (index, "b")
     return None
+
+
+def _polarities(tokens: list[str]) -> set[tuple[int, str]]:
+    """Polarity marks in token order; a negation token flips the last one."""
+    found: list[tuple[int, str]] = []
+    for token in tokens:
+        if token.startswith(_NEGATION_PREFIXES) and found:
+            pair, side = found.pop()
+            found.append((pair, "b" if side == "a" else "a"))
+            continue
+        mark = _polarity_of(token)
+        if mark is not None:
+            found.append(mark)
+    return set(found)
+
+
+def _two_sided(marks: set[tuple[int, str]]) -> bool:
+    return any((pair, "a") in marks and (pair, "b") in marks for pair, _ in marks)

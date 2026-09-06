@@ -32,7 +32,8 @@ from .memory import MemoryStore
 from .memory_text import clip, tokenize
 
 SUMMARY_INTERVAL_DAYS = 7.0
-SUMMARY_EVIDENCE_LIMIT = 8
+SUMMARY_EVIDENCE_CAP = 200      # rows read per pair for counts and highlights
+SUMMARY_SOURCE_LIMIT = 8        # ids recorded as the summary's sources
 SUMMARY_MIN_EVIDENCE = 3
 SUMMARY_LOOKBACK_DAYS = 30.0
 SUMMARY_CONFIDENCE = 0.8
@@ -98,7 +99,7 @@ class RuleSummarizer:
         if finding.kind == "missed_recall":
             return f"'{subject}' 이야기가 나왔을 때 떠오른 기억이 없었다. 다음엔 그 일을 먼저 물어보자."
         if finding.kind == "open_promise":
-            return f"'{subject}' 약속이 {finding.days}일째 열려 있다. 다음 대화에서 먼저 꺼내자."
+            return f"'{subject}' 약속이 며칠째 열려 있다. 다음 대화에서 먼저 꺼내자."
         if finding.kind == "disputed_inference":
             return f"'{subject}' 추측은 정설과 어긋나 보류 중이다. 플레이어에게 확인해 보자."
         raise ValueError("Unknown finding kind: " + finding.kind)
@@ -125,7 +126,7 @@ def refresh_relationship_summaries(
     sims = store.session_sims(session_id)[:MAX_PAIR_SIMS]
     created: list[int] = []
     for (a, a_name, _), (b, b_name, _) in combinations(sims, 2):
-        rows = store.pair_evidence(session_id, a, b, since=now - lookback_days * DAY, limit=SUMMARY_EVIDENCE_LIMIT)
+        rows = store.pair_evidence(session_id, a, b, since=now - lookback_days * DAY, limit=SUMMARY_EVIDENCE_CAP)
         previous = store.relationship_summary(session_id, a, b)
         if previous is not None:
             written = float(previous["created_at_real"])
@@ -136,7 +137,8 @@ def refresh_relationship_summaries(
                 # would mislead, so it retires instead of lingering.
                 store.archive(int(previous["memory_id"]))
                 continue
-            if not any(float(r["created_at_real"]) > written for r in rows):
+            # "New evidence" is checked on its own, not on the highlight sample.
+            if not store.pair_evidence(session_id, a, b, since=written + 1e-6, limit=1):
                 continue
         elif len(rows) < min_evidence:
             continue
@@ -145,8 +147,8 @@ def refresh_relationship_summaries(
         new_id = store.add_memory(
             session_id, "relationship_summary", text, provenance="ai_inferred",
             confidence=SUMMARY_CONFIDENCE, importance=SUMMARY_IMPORTANCE,
-            entities={a: "actor", b: "target"}, source_ids=[e.memory_id for e in evidence],
-            created_at=now,
+            entities={a: "actor", b: "target"},
+            source_ids=[e.memory_id for e in evidence[:SUMMARY_SOURCE_LIMIT]], created_at=now,
         )
         if previous is not None:
             store.supersede(int(previous["memory_id"]), new_id)
@@ -175,7 +177,20 @@ def findings(store: MemoryStore, session_id: str, *, window_days: float = REFLEC
             continue
         seen.add(tokens)
         found.append(Finding("missed_recall", str(miss["query"]), (), tokens))
-    return found
+    return _interleave(found)
+
+
+def _interleave(found: list[Finding]) -> list[Finding]:
+    """One of each kind first (promise, dispute, miss), then the rest in
+    order, so a pile of open promises cannot starve the other kinds."""
+    order = ("open_promise", "disputed_inference", "missed_recall")
+    queues = {kind: [f for f in found if f.kind == kind] for kind in order}
+    result: list[Finding] = []
+    while any(queues.values()):
+        for kind in order:
+            if queues[kind]:
+                result.append(queues[kind].pop(0))
+    return result
 
 
 def reflect(store: MemoryStore, session_id: str, *, summarizer: Summarizer | None = None,
@@ -193,6 +208,10 @@ def reflect(store: MemoryStore, session_id: str, *, summarizer: Summarizer | Non
         if len(created) >= max_lines:
             break
         text = summarizer.reflection(finding)
+        # One note per subject: an open promise stays one note however many
+        # runs see it, and a repeated query is not repeated advice.
+        if finding.source_ids and store.active_note(session_id, finding.kind, list(finding.source_ids)) is not None:
+            continue
         if store.recently_stored(session_id, text, window_days=window_days):
             continue
         created.append(store.add_memory(
@@ -220,4 +239,5 @@ def maintain(store: MemoryStore, session_id: str | None = None, *,
             continue
         result["summaries"] += len(refresh_relationship_summaries(store, scope, summarizer=summarizer))
         result["reflections"] += len(reflect(store, scope, summarizer=summarizer))
+    store.reset_turn_counter()
     return result

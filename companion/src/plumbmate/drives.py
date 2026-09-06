@@ -10,6 +10,7 @@ action and never calls a model.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 MOTIVES = ("hunger", "energy", "social", "fun", "hygiene", "bladder")
@@ -28,6 +29,8 @@ def urgency(value: float) -> float:
     try:
         level = float(value)
     except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(level):
         return 0.0
     return max(0.0, min(1.0, (SET_POINT - level) / (SET_POINT - FLOOR)))
 
@@ -77,8 +80,8 @@ def describe(motives: dict[str, Any] | None, buffs: list[str] | None = None,
             parts.append("욕구: 안정")
     if mood:
         parts.append("기분: " + " ".join(str(mood).split())[:40])
-    if buffs:
-        shown = [" ".join(str(item).split())[:30] for item in buffs[:4] if str(item).strip()]
+    if isinstance(buffs, (list, tuple)) and buffs:
+        shown = [" ".join(str(item).split())[:30] for item in list(buffs)[:4] if str(item).strip()]
         if shown:
             parts.append("버프: " + ", ".join(shown))
     line = " | ".join(parts)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -136,8 +137,16 @@ def _main(argv: list[str] | None = None) -> int:
     def open_memory() -> MemoryStore | None:
         if getattr(args, "no_memory", False):
             return None
-        target = getattr(args, "memory_db", None) or (paths.state / "memory.sqlite3")
-        return MemoryStore(target)
+        chosen = getattr(args, "memory_db", None)
+        target = Path(chosen).expanduser() if chosen else (paths.state / "memory.sqlite3")
+        if args.command in {"memory-search", "memory-stats", "memory-admin"}:
+            return MemoryStore(target)  # a broken store is the whole point of these commands
+        try:
+            return MemoryStore(target)
+        except sqlite3.Error as exc:
+            # Memory never decides a turn's fate: serve without it.
+            print(f"memory: store unavailable ({exc}); recording and recall are OFF this run", flush=True)
+            return None
 
     if args.command == "memory-stats":
         with open_memory() as memory:
@@ -190,11 +199,17 @@ def _main(argv: list[str] | None = None) -> int:
                             print(f"{scope} #{memory_id}: {row.get('summary', '')}")
                 elif args.action == "maintain":
                     print(json.dumps(maintain(memory, args.session), ensure_ascii=False))
-            except (KeyError, ValueError) as exc:
+            except KeyError:
+                print("no such memory")
+                return 1
+            except ValueError as exc:
                 print("memory-admin: " + str(exc))
                 return 2
         return 0
     if args.command == "memory-search":
+        if args.limit < 1:
+            print("--limit must be positive")
+            return 2
         with open_memory() as memory:
             for item in memory.search(args.query, session_id=args.session, limit=args.limit):
                 print(json.dumps({"memory_id": item.memory_id, "score": item.score, "type": item.memory_type,
@@ -213,10 +228,14 @@ def _main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
     if args.command in {"serve-once", "serve"}:
+        if args.max_turns < 1:
+            print("--max-turns must be positive")
+            return 2
+        provider = create_provider(args.provider)
         memory = open_memory()
-        engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns,
+        engine = CompanionEngine(paths, provider, max_attempts=args.max_turns,
                                  memory=memory, recall=args.recall)
-        if args.recall:
+        if engine.recall_enabled:
             print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         try:
             if args.command == "serve-once":
@@ -242,14 +261,17 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     if args.command in {"listen", "run"}:
         engine = None
-        memory = open_memory()
+        provider = None
         if args.command == "run":
             if args.max_turns < 1:
                 print("--max-turns must be positive")
                 return 2
-            engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns,
+            provider = create_provider(args.provider)
+        memory = open_memory()
+        if provider is not None:
+            engine = CompanionEngine(paths, provider, max_attempts=args.max_turns,
                                      memory=memory, recall=args.recall)
-            if args.recall:
+            if engine.recall_enabled:
                 print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         # The socket layer is loopback-only and refuses to start without a token.
         try:
@@ -322,6 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except json.JSONDecodeError:
         print("PlumbMate: input must be valid JSON.", flush=True)
+        return 2
+    except sqlite3.Error as exc:
+        print(f"PlumbMate: memory store unusable ({exc}); check --memory-db.", flush=True)
         return 2
 
 
