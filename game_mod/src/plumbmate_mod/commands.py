@@ -10,11 +10,16 @@ inspected, stopped, or pointed somewhere by hand.
 import datetime
 import json
 import os
+import re
 import time
 import uuid
 
 import services
 import sims4.commands
+try:
+    import plumbmate_turn_bridge
+except Exception:
+    plumbmate_turn_bridge = None
 
 # The build publishes these as root-level modules, like the diagnostic probe.
 # A partial or stale install must degrade to the filesystem bridge, not break
@@ -43,7 +48,6 @@ except Exception as _exc:
 
 PROTOCOL_VERSION = "0.1"
 MOD_VERSION = "0.1.1-alpha.1"
-ARCHIVE_SUFFIX = ".ts4script"
 DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
 
@@ -60,9 +64,10 @@ _LAST_REQUEST_ID = None
 
 def _mod_directory():
     source_path = os.path.abspath(__file__)
-    marker = source_path.lower().find(ARCHIVE_SUFFIX)
-    if marker >= 0:
-        archive_path = source_path[: marker + len(ARCHIVE_SUFFIX)]
+    # Match on the original string: Unicode lowercasing can change its length.
+    marker = re.search(r"\.ts4script(?=[/\\]|$)", source_path, re.IGNORECASE | re.ASCII)
+    if marker is not None:
+        archive_path = source_path[:marker.end()]
         return os.path.dirname(archive_path)
     return os.path.dirname(os.path.dirname(os.path.dirname(source_path)))
 
@@ -97,21 +102,26 @@ def _sim_name(sim_info):
 
 
 def _active_sim(connection):
-    client = services.client_manager().get(connection)
-    return getattr(client, "active_sim", None) if client is not None else None
+    try:
+        manager = services.client_manager()
+        client = manager.get(connection) if manager is not None else None
+        return getattr(client, "active_sim", None) if client is not None else None
+    except Exception:
+        # Main menu / household transitions have no usable active client.
+        return None
 
 
 def _snapshot(sim):
     sim_info = sim.sim_info
     actor = {
         "sim_id": int(getattr(sim_info, "sim_id", getattr(sim, "id", 0))),
-        "name": _sim_name(sim_info),
-        "age": _safe_text(getattr(sim_info, "age", "")),
-        "gender": _safe_text(getattr(sim_info, "gender", "")),
+        "name": _sim_name(sim_info)[:128],
+        "age": _safe_text(getattr(sim_info, "age", ""))[:40],
+        "gender": _safe_text(getattr(sim_info, "gender", ""))[:40],
     }
     try:
         mood = sim.get_mood()
-        actor["mood"] = _safe_text(getattr(mood, "__name__", mood))
+        actor["mood"] = _safe_text(getattr(mood, "__name__", mood))[:80]
     except Exception:
         pass
 
@@ -120,7 +130,7 @@ def _snapshot(sim):
         for member in sim.household.sim_info_gen():
             household.append({
                 "sim_id": int(getattr(member, "sim_id", 0)),
-                "name": _sim_name(member),
+                "name": _sim_name(member)[:128],
             })
             if len(household) >= 12:
                 break
@@ -131,6 +141,8 @@ def _snapshot(sim):
 
 def _write_request(sim, message):
     global _LAST_REQUEST_ID
+    if plumbmate_turn_bridge is None:
+        raise ValueError("Turn bridge module missing; reinstall the complete PlumbMate archive")
     root = _ensure_directories()
     actor, household = _snapshot(sim)
     request_id = uuid.uuid4().hex
@@ -138,7 +150,7 @@ def _write_request(sim, message):
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
         "kind": "turn",
-        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "player_message": _safe_text(message)[:1000],
         # Until save lineage receipts are implemented, a household ID cannot
         # authorize cross-save memory reuse. This alpha isolates each turn.
@@ -149,39 +161,15 @@ def _write_request(sim, message):
         "recent_events": [],
         "memory_summary": "",
     }
-    target = os.path.join(root, "requests", request_id + ".json")
-    temporary = target + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(temporary, target)
+    target = plumbmate_turn_bridge.write_request(root, payload)
     _LAST_REQUEST_ID = request_id
     return target
 
 
 def _latest_response():
-    if _LAST_REQUEST_ID is None:
-        return None
-    path = os.path.join(_bridge_directory(), "responses", _LAST_REQUEST_ID + ".json")
-    if not os.path.isfile(path):
-        return None
-    if os.path.islink(path):
-        raise ValueError("Symlinked responses are not accepted")
-    with open(path, "rb") as handle:
-        raw = handle.read(65537)
-    if len(raw) > 65536:
-        raise ValueError("Response exceeds size limit")
-    response = json.loads(raw.decode("utf-8"))
-    if (not isinstance(response, dict) or response.get("request_id") != _LAST_REQUEST_ID
-            or response.get("protocol_version") != PROTOCOL_VERSION):
-        raise ValueError("Response does not match the pending turn")
-    if not isinstance(response.get("partner_message"), str) or len(response["partner_message"]) > 500:
-        raise ValueError("Invalid response text")
-    action = response.get("action")
-    if not isinstance(action, dict) or action.get("name") not in (
-            "suggest_only", "queue_social", "queue_self_interaction", "cancel_current"):
-        raise ValueError("Invalid action suggestion")
-    return response
-
+    if plumbmate_turn_bridge is None:
+        raise ValueError("Turn bridge module missing; reinstall the complete PlumbMate archive")
+    return plumbmate_turn_bridge.read_response(_bridge_directory(), _LAST_REQUEST_ID)
 
 def _state_file(name):
     return os.path.join(_bridge_directory(), "state", name)
@@ -403,11 +391,15 @@ def plumbmate_status(_connection=None):
 
 
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)
-def plumbmate_chat(message: str = "", _connection=None):
+def plumbmate_chat(*message_parts, _connection=None):
     output = sims4.commands.CheatOutput(_connection)
     sim = _active_sim(_connection)
     if sim is None:
         output("PlumbMate: active Sim not found. Load a household first.")
+        return
+    message = " ".join(_safe_text(part) for part in message_parts).strip()[:1000]
+    if not message:
+        output("PlumbMate: enter a message after plumbmate.chat.")
         return
     try:
         target = _write_request(sim, message)
@@ -422,7 +414,18 @@ def plumbmate_read(_connection=None):
     try:
         response = _latest_response()
         if response is None:
-            output("PlumbMate: no response yet.")
+            status = plumbmate_turn_bridge.read_status(_bridge_directory(), _LAST_REQUEST_ID)
+            if status is None:
+                output("PlumbMate: 응답 대기 중. 동반 앱이 켜져 있는지 확인해 주세요.")
+            elif status["phase"] == "failed":
+                messages = {
+                    "invalid_request": "요청 형식이 맞지 않아 처리하지 못했어요.",
+                    "provider_failed": "모델 응답에 실패했어요. 중복 호출 방지를 위해 자동 재시도하지 않아요.",
+                    "session_limit": "이번 세션의 호출 한도에 도달했어요. 동반 앱에서 한도를 확인해 주세요.",
+                }
+                output("PlumbMate: " + messages.get(status["reason_code"], "응답을 처리하지 못했어요."))
+            else:
+                output("PlumbMate: 동반 앱에서 요청을 처리하고 있어요.")
             return
         action = response.get("action", {})
         output(_safe_text(response.get("partner_message", "")))

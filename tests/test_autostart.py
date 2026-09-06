@@ -109,6 +109,7 @@ class AutostartTests(unittest.TestCase):
         sys.modules["zone"].Zone = self.zone_class
         _load_root_module("plumbmate_bridge_client", "bridge_client.py")
         _load_root_module("plumbmate_tick_driver", "tick_driver.py")
+        _load_root_module("plumbmate_turn_bridge", "turn_bridge.py")
         spec = importlib.util.spec_from_file_location(
             "plumbmate_boot_under_test", self.boot_source
         )
@@ -417,6 +418,48 @@ class AutostartTests(unittest.TestCase):
 
     def test_stop_preserves_foreign_wrapper_with_copied_markers(self):
         self._stop_under_foreign_wrapper(True)
+
+    def test_multiword_chat_round_trip_with_active_sim(self):
+        from plumbmate.engine import CompanionEngine
+        from plumbmate.protocol import BridgePaths, read_json
+        from plumbmate.providers import MockProvider
+
+        module = self.boot()
+        info = types.SimpleNamespace(sim_id=42, full_name="Test Partner", age="ADULT", gender="X")
+        sim = types.SimpleNamespace(sim_info=info)
+        manager = types.SimpleNamespace(get=lambda connection: types.SimpleNamespace(active_sim=sim))
+        lines = []
+        with mock.patch.object(module.services, "client_manager", return_value=manager), \
+                mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            # TS4 passes each token positionally and _connection by keyword.
+            module.plumbmate_chat("오늘", "같이", "산책할까?", _connection=7)
+            paths = BridgePaths(self.mods_root / "PlumbMateBridge")
+            request_path, = paths.requests.glob("*.json")
+            self.assertEqual(read_json(request_path)["player_message"], "오늘 같이 산책할까?")
+            self.assertIsNotNone(CompanionEngine(paths, MockProvider()).process_one())
+            module.plumbmate_read(_connection=7)
+        self.assertTrue(any("오늘 같이 산책할까?" in line for line in lines))
+
+    def test_chat_without_client_manager_is_a_normal_refusal(self):
+        module = self.boot()
+        lines = []
+        with mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            module.plumbmate_chat("hello", "there", _connection=7)
+        self.assertTrue(any("active Sim not found" in line for line in lines))
+
+    def test_unicode_path_does_not_shift_archive_boundary(self):
+        module = self.boot()
+        with mock.patch.object(module, "__file__", "/Users/İ/Mods/PlumbMate.TS4SCRIPT/plumbmate_boot.pyc"):
+            self.assertEqual(module._mod_directory(), "/Users/İ/Mods")
+
+    def test_unicode_digits_are_rejected_before_socket_creation(self):
+        module = self.boot()
+        client_module = module.plumbmate_bridge_client
+        for host in ("１２７.０.０.１", "127.٠.٠.١", "127.00.0.1", "127.0.0.01"):
+            with self.subTest(host=host), mock.patch.object(client_module.socket, "socket") as factory:
+                with self.assertRaises(ValueError):
+                    client_module.BridgeClient(TOKEN, 47651, host=host)
+                factory.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/plumbmate/response.schema.json",
+  "title": "PlumbMate turn response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "partner_message",
+    "action",
+    "memory_patch"
+  ],
+  "properties": {
+    "protocol_version": {"const": "0.1"},
+    "request_id": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$"},
+    "partner_message": {"type": "string", "maxLength": 500},
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "arguments", "reason"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "suggest_only",
+            "queue_social",
+            "queue_self_interaction",
+            "cancel_current"
+          ]
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_sim_id", "interaction", "idea"],
+          "properties": {
+            "target_sim_id": {"type": ["string", "null"], "maxLength": 240},
+            "interaction": {"type": ["string", "null"], "maxLength": 240},
+            "idea": {"type": ["string", "null"], "maxLength": 240}
+          }
+        },
+        "reason": {"type": "string", "maxLength": 240}
+      }
+    },
+    "memory_patch": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {"type": "string", "maxLength": 240}
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "estimated_input_tokens": {"type": "integer", "minimum": 0},
+        "max_output_tokens": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

@@ -12,6 +12,7 @@ stack works. No external address is contacted and nothing sleeps.
 import datetime
 import json
 import os
+import re
 import sys
 import uuid
 
@@ -26,10 +27,10 @@ SESSION_ID = uuid.uuid4().hex
 
 def _diagnostic_directory():
     source = os.path.abspath(__file__)
-    marker = source.lower().find(".ts4script")
-    if marker < 0:
+    marker = re.search(r"\.ts4script(?=[/\\]|$)", source, re.IGNORECASE | re.ASCII)
+    if marker is None:
         raise RuntimeError("Diagnostic must run from its dedicated .ts4script")
-    archive = source[:marker + len(".ts4script")]
+    archive = source[:marker.end()]
     return os.path.join(os.path.dirname(archive), "PlumbMateDiagnostics")
 
 

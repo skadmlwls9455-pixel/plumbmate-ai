@@ -1,59 +1,67 @@
-# Architecture and safety model
+# Architecture: implemented foundation vs target product
 
-## Components
+Updated 2026-09-06. The master RFC map describes a target, not shipped behavior.
 
-```text
-The Sims 4
-  └─ PlumbMate.ts4script
-       └─ small JSON request files
-            ↓
-       local bridge directory
-            ↓
-  companion process ── provider adapter ── optional external model API
-            ↓
-       validated JSON response
-            ↓
-  player review → allow-listed game action (future milestone)
-```
+## Current responsibilities
 
-The game process never makes an internet request. The companion is the only
-network-capable component, so it can keep provider credentials outside the game
-and make data transmission visible and optional.
+- `game_mod/commands.py`: EA snapshot queries, cheat registration/output, bridge startup configuration.
+- `game_mod/turn_bridge.py`: bounded file requests/responses and user-facing turn receipts. Runs only from explicit commands, never the tick pump.
+- `game_mod/tick_driver.py`: hook ownership, suspension, bounded pump scheduling.
+- `game_mod/bridge_client.py`: nonblocking, literal-loopback transport and authentication on the engine thread. No model calls or worker threads here.
+- `companion/contracts.py` + `schemas/`: canonical shape/type/length/allow-list contracts, compiled once at companion startup. Provider-generated fields derive from the response contract; identifiers remain locally owned.
+- `companion/protocol.py`: bounded JSON file exchange and request enumeration, re-exporting contracts for existing callers.
+- `companion/budget.py`: validated context packing and per-process attempt allowance; no billing claims.
+- `companion/engine.py`: request validation, context policy, duplicate response check, attempt reservation, provider invocation, final validation, quarantine, status.
+- `companion/turn_status.py`: best-effort non-narrative processing/failure receipts, not a transactional action/save ledger.
+- `companion/event_socket.py`: loopback listener and pure-Python companion workers. Settings/framing/server can be separated later; no game APIs are called by workers.
+- `companion/cli.py`: configuration, service loops, and human-readable progress. Attempt accounting is owned by the engine, not duplicated per command.
 
-## Trust boundaries
+## Boundaries that must remain true
 
-1. **Game state is private by default.** Only fields defined by the public
-   request schema can cross the bridge.
-2. **Model output is untrusted.** It must pass the response schema and action
-   allow-list before the game sees it.
-3. **No arbitrary commands.** A model cannot provide Python, console commands,
-   file paths, tuning identifiers, or mouse/keyboard instructions for execution.
-4. **Approval before impact.** The intended product asks the player before a
-   social or object interaction is queued.
-5. **Fail closed.** Missing identifiers, malformed JSON, unknown actions, stale
-   responses, and unavailable providers all become `suggest_only` or an error.
+1. Game code stays Python 3.7-compatible and never imports companion dependencies. The build manifest must include every published local module.
+2. Game ticks perform bounded nonblocking socket work, not file polling, model calls, or background EA API calls. Endpoint files are persistent configuration, not liveness signals.
+3. No field outside the request schema reaches a provider. Model output cannot override request identifiers or introduce executable commands. A syntactically valid action is still only a suggestion in this prototype.
+4. Final responses are validated *after* local transforms. Game reads match the specific request ID; global newest-response lookup is only a developer CLI tool.
+5. Unknown save scope means no persistent RP memory restoration. Model-generated patches are not promoted to observed facts. Existing session files are preserved but ignored.
+6. API uncertainty does not trigger automatic retries during normal single-engine processing. Connection retries are independent from paid model retries.
+7. Sequential server lifecycle control: stop admissions before sweeping connections. Retain timed-out worker references and refuse restart while old workers survive.
 
-## Token and cost strategy
+## Resource and privacy limits
 
-- Trigger on a player message or meaningful event, never on every simulation
-  tick or rendered frame.
-- Send structured state, not screenshots or raw save data.
-- Hash the last state and send `state_delta` only when fields change.
-- Keep a local fact memory capped at a small number of relationship-relevant
-  facts; summarize at milestones rather than every turn.
-- Put stable persona and safety instructions first so provider prompt caching can
-  reuse the prefix.
-- Use short structured output and a hard `max_output_tokens` limit.
-- Use a small/low-latency model for ordinary turns; escalate only for rare story
-  planning turns. Model routing is a companion setting, not model-generated.
-- Debounce duplicate events and cache equivalent low-stakes replies locally.
-- Record provider-reported usage without recording secrets or full private
-  prompts in analytics.
+Request/response files and socket frames are capped at 64 KiB. Context JSON is
+capped at 12,000 UTF-8 bytes; optional items are removed without altering the
+current message or actor. Per-field limits come from one schema, not parallel
+hand-written validators. Public schema copies are generated and checked by CI.
 
-## Privacy disclosure for a public release
+All CLI engine modes default to 20 model attempts per process, including failed
+attempts. The context token estimate is a coarse UTF-8 heuristic and excludes
+API envelope/system/schema overhead; it is not provider usage or a money limit.
+Daily persisted spend limits and usage reconciliation are not implemented.
 
-The installer and README should show the exact request schema, provider,
-retention choice, and example payload before asking for a key. Local/mock mode
-must remain usable without an account. Logs should redact keys and offer a clear
-delete-history control.
+Event payload logging is opt-in. Turn receipts contain only request IDs and
+fixed status/reason codes. Local request/response archives still contain private
+play text; retention, export, deletion UI, and disk quotas remain release work.
 
+## Not implemented yet
+
+The autonomous NPC-like partner, selected partner binding, observed event
+atomization, verified save/branch receipts, memory DB/retrieval, L0–L3 router,
+IC scheduler, and relationship features remain separate milestones. Pure
+save-lineage and state-delta helpers exist but are not proof of end-to-end use.
+
+A future memory DB can grow without growing every prompt: scope-filtered indexed
+retrieval, local ranking, deduplication, and fixed-budget packing must sit between
+storage and model context. A byte cap alone does not solve relevance or RP quality.
+
+## Verification and remaining release gates
+
+CI is configured for the installed companion on macOS/Ubuntu, Python 3.11/3.13,
+plus game-source 3.7 syntax and schema export guards. Positive stub tests cover
+multiword Korean chat through files, mock response, and game display. Local
+game-runtime builds check bytecode compatibility separately; neither CI nor a
+build proves gameplay.
+
+Before a release: in-game smoke, response/save-scope isolation, request claiming
+against multiple consumers or process crashes, actual usage accounting, disk
+retention, and an ordinary-player UI. See the Korean UX/context review for the
+priority order. Do not mask transport failures as invented character behavior.

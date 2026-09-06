@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .budget import TokenBudget, clamp_request
+from .contracts import model_output_schema, validate_model_output
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_response
 
 
@@ -49,42 +50,7 @@ class MockProvider:
         return response
 
 
-RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["partner_message", "action", "memory_patch"],
-    "properties": {
-        "partner_message": {"type": "string", "maxLength": 500},
-        "action": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["name", "arguments", "reason"],
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "enum": ["suggest_only", "queue_social", "queue_self_interaction", "cancel_current"],
-                },
-                "arguments": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["target_sim_id", "interaction", "idea"],
-                    "properties": {
-                        "target_sim_id": {"type": ["string", "null"]},
-                        "interaction": {"type": ["string", "null"]},
-                        "idea": {"type": ["string", "null"], "maxLength": 240},
-                    },
-                },
-                "reason": {"type": "string", "maxLength": 240},
-            },
-        },
-        "memory_patch": {
-            "type": "array",
-            "maxItems": 3,
-            "items": {"type": "string", "maxLength": 240},
-        },
-    },
-}
-
+RESPONSE_SCHEMA: dict[str, Any] = model_output_schema()
 
 @dataclass
 class OpenAIResponsesProvider:
@@ -158,10 +124,11 @@ class OpenAIResponsesProvider:
         except json.JSONDecodeError as exc:
             raise ProtocolError("OpenAI output was not valid JSON") from exc
 
+        validate_model_output(generated)
         response = {
+            **generated,
             "protocol_version": PROTOCOL_VERSION,
             "request_id": request["request_id"],
-            **generated,
             "budget": {
                 "estimated_input_tokens": budget.estimated_input_tokens,
                 "max_output_tokens": budget.max_output_tokens,

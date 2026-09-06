@@ -50,7 +50,27 @@ def newest_response(paths: BridgePaths) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
-def main(argv: list[str] | None = None) -> int:
+def _process_turn(engine: CompanionEngine, *, fail_on_error: bool = False) -> Path | None:
+    """One visible result path for all CLI service modes."""
+    before = engine.budget.attempts
+    try:
+        result = engine.process_one()
+    except ProtocolError as exc:
+        if fail_on_error:
+            raise
+        print(str(exc), flush=True)
+        result = None
+    if engine.budget.attempts != before:
+        budget = engine.budget
+        print(f"model attempts: {budget.attempts}/{budget.max_attempts}; "
+              f"context estimate total: ~{budget.estimated_context_tokens} tokens "
+              "(not provider usage or money)", flush=True)
+    if result is not None:
+        print("turn completed: " + result.name, flush=True)
+    return result
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="plumbmate")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -73,7 +93,9 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--port", type=int, default=None,
                              help="Reuse configured port (initially 47651); 0 is manual discovery")
             sub.add_argument("--events", type=int, default=0, help="Stop after N events")
-        if command == "run":
+        if command in {"listen", "run"}:
+            sub.add_argument("--verbose-events", action="store_true", help="Include private event payloads in local console output")
+        if command in {"serve-once", "serve", "run"}:
             sub.add_argument("--max-turns", type=int, default=20,
                              help="Maximum model attempts this session; no silent automatic retries")
         if command == "mock-event":
@@ -95,21 +117,16 @@ def main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
     if args.command in {"serve-once", "serve"}:
-        engine = CompanionEngine(paths, create_provider(args.provider))
+        engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
         if args.command == "serve-once":
-            result = engine.process_one()
-            print(result if result else "no pending request")
+            result = _process_turn(engine, fail_on_error=True)
+            if result is None:
+                print("no completed turn; check pending requests or turn status")
             return 0
         try:
             while True:
-                try:
-                    result = engine.process_one()
-                except ProtocolError as exc:
-                    print(str(exc), flush=True)
-                    continue
-                if result:
-                    print(result, flush=True)
-                else:
+                result = _process_turn(engine)
+                if result is None:
                     time.sleep(max(0.1, args.interval))
         except KeyboardInterrupt:
             return 0
@@ -125,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.max_turns < 1:
                 print("--max-turns must be positive")
                 return 2
-            engine = CompanionEngine(paths, create_provider(args.provider))
+            engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
         # The socket layer is loopback-only and refuses to start without a token.
         try:
             server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port))
@@ -138,30 +155,22 @@ def main(argv: list[str] | None = None) -> int:
             write_endpoint(paths, "127.0.0.1", server.port)
             print(f"listening on 127.0.0.1:{server.port}", flush=True)
             seen = 0
-            attempts = 0
+            limit_announced = False
             try:
                 while args.events <= 0 or seen < args.events:
-                    if engine is not None and attempts < args.max_turns:
-                        # Count uncertain failures too; never retry them.
-                        try:
-                            result = engine.process_one()
-                        except ProtocolError as exc:
-                            attempts += 1
-                            print(str(exc), flush=True)
-                        else:
-                            if result is not None:
-                                attempts += 1
-                                print("turn completed", flush=True)
-                        if attempts >= args.max_turns:
+                    if engine is not None:
+                        _process_turn(engine)
+                        if engine.budget.exhausted and not limit_announced:
+                            limit_announced = True
                             print("Session turn limit reached; no further model calls. Restart explicitly to continue.", flush=True)
                     event = server.poll(timeout=0.25)
                     if event is None:
                         continue
                     seen += 1
-                    print(json.dumps({
-                        "kind": event.kind, "event_id": event.event_id,
-                        "payload": event.payload, "received_at": event.received_at,
-                    }, ensure_ascii=False), flush=True)
+                    summary = {"kind": event.kind, "event_id": event.event_id, "received_at": event.received_at}
+                    if args.verbose_events:
+                        summary["payload"] = event.payload
+                    print(json.dumps(summary, ensure_ascii=False), flush=True)
             except KeyboardInterrupt:
                 pass
         finally:
@@ -185,6 +194,20 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(read_json(latest), ensure_ascii=False, indent=2))
         return 0
     return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (ProtocolError, SocketBridgeError) as exc:
+        print("PlumbMate: " + str(exc), flush=True)
+        return 2
+    except OSError:
+        print("PlumbMate: local file/socket operation failed; check the bridge path and permissions.", flush=True)
+        return 2
+    except json.JSONDecodeError:
+        print("PlumbMate: input must be valid JSON.", flush=True)
+        return 2
 
 
 if __name__ == "__main__":

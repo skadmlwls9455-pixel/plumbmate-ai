@@ -5,9 +5,8 @@ from __future__ import annotations
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any
 
-from .budget import clamp_request
+from .budget import SessionBudget, clamp_request
 from .protocol import (
     BridgePaths,
     ProtocolError,
@@ -18,14 +17,16 @@ from .protocol import (
     validate_response,
 )
 from .providers import Provider
+from .turn_status import write_turn_status
 
 
 class CompanionEngine:
-    def __init__(self, paths: BridgePaths, provider: Provider) -> None:
+    def __init__(self, paths: BridgePaths, provider: Provider, *, max_attempts: int = 20) -> None:
         self.paths = paths
         self.provider = provider
         self.paths.ensure()
         self.rejected_requests = 0
+        self.budget = SessionBudget(max_attempts=max_attempts)
 
     def _quarantine(self, path: Path) -> None:
         destination = self.paths.archive / "rejected"
@@ -42,28 +43,37 @@ class CompanionEngine:
                 validate_request(request)
                 if request_path.stem != request["request_id"]:
                     raise ProtocolError("Request filename and identifier differ")
+                # No verified save receipt exists in this alpha. A household
+                # ID cannot authorize cross-turn state or factual memory reuse.
+                request["memory_summary"] = ""
+                request["state_delta"] = {}
                 request = clamp_request(request)
             except ProtocolError:
+                write_turn_status(self.paths, request_path.stem, "failed", "invalid_request")
                 self._quarantine(request_path)
                 continue
-            # No verified save receipt exists in this alpha. No cross-turn
-            # state delta or factual memory restoration based on household IDs.
-            request["memory_summary"] = ""
-            request["state_delta"] = {}
             response_path = self.paths.responses / f"{request['request_id']}.json"
             if response_path.exists():
                 self._quarantine(request_path)
                 continue
+            if not self.budget.reserve(request):
+                write_turn_status(self.paths, request["request_id"], "failed", "session_limit")
+                self._quarantine(request_path)
+                continue
+            write_turn_status(self.paths, request["request_id"], "processing")
             try:
                 response = self.provider.respond(request)
                 validate_response(response, expected_request_id=request["request_id"])
-                response = dict(response, memory_patch=[], memory_policy="disabled_unverified_scope")
+                response = dict(response, memory_patch=[])
+                validate_response(response, expected_request_id=request["request_id"])
                 atomic_write_json(response_path, response)
             except Exception as exc:
                 # Timeouts may already incur charges: retain, never auto-retry.
+                write_turn_status(self.paths, request["request_id"], "failed", "provider_failed")
                 self._quarantine(request_path)
                 raise ProtocolError("Turn failed; retained in archive/rejected; no automatic retry") from exc
             shutil.move(str(request_path), str(self.paths.archive / request_path.name))
+            write_turn_status(self.paths, request["request_id"], "completed")
             return response_path
         return None
 

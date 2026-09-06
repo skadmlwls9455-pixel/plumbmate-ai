@@ -1,5 +1,7 @@
 # 구조·기획 일치 감사 및 통합 인계
 
+> 이 문서는 9월 5일의 감사 기록이다. 이후 수정 상태는 `FOUNDATION_INTEGRATION_2026-09-05_KO.md`와 `UX_CONTEXT_REVIEW_2026-09-06_KO.md`를 따른다. 아래의 "남은 결함"은 당시 기준이며 최신 코드에 그대로 남아 있다는 뜻이 아니다.
+
 ## 범위와 판정
 
 검토 대상은 `main@81da97c`, 그 위의 루멘 로컬 변경(195개 테스트), [페이블 PR #1](https://github.com/skadmlwls9455-pixel/plumbmate-ai/pull/1)의 `d45a4d0`이다. 테스트 수가 같다고 같은 테스트/코드라는 뜻은 아니다. PR은 검토 당시 draft/open이었으며, [CI run 4](https://github.com/skadmlwls9455-pixel/plumbmate-ai/actions/runs/33967059060)의 macOS·Ubuntu 작업 성공을 API로 확인했다.

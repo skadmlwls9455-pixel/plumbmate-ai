@@ -30,7 +30,8 @@ actions yet.
 2. The local companion reads the request and asks a configured provider for a
    short Korean reply plus one structured action suggestion.
 3. The response is written back to the local bridge directory.
-4. `plumbmate.read` displays the newest response in the cheat console.
+4. `plumbmate.read` displays the response matching the last submitted request,
+   or its processing/failure/session-limit status. It never reads another turn's newest file.
 
 The current game-side adapter reports only a safe, small identity/household
 snapshot. Action execution is intentionally disabled in this first milestone.
@@ -89,14 +90,29 @@ tests/           Offline tests; no game or API key required
 ## Try the companion without the game
 
 ```bash
-PYTHONPATH=companion/src python3 -m plumbmate.cli init --bridge .plumbmate
-PYTHONPATH=companion/src python3 -m plumbmate.cli demo --bridge .plumbmate
-PYTHONPATH=companion/src python3 -m plumbmate.cli serve-once \
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+python -m plumbmate.cli init --bridge .plumbmate
+python -m plumbmate.cli demo --bridge .plumbmate
+python -m plumbmate.cli serve-once \
   --bridge .plumbmate --provider mock
-PYTHONPATH=companion/src python3 -m plumbmate.cli show-latest --bridge .plumbmate
+python -m plumbmate.cli show-latest --bridge .plumbmate
 ```
 
-Packaging metadata is also included for an editable installation.
+The companion installs `jsonschema`; the game's embedded Python does not.
+Canonical contracts live in `companion/src/plumbmate/schemas/`. Run
+`python scripts/export_contracts.py` after editing them. CI checks the public
+`protocol/` copies and validates requests/responses using the same schemas.
+
+`serve`, `serve-once`, and `run` share a default **20 model attempts per process**
+(`--max-turns`). Uncertain failures consume an attempt. This is not a daily or
+monetary limit; restarting starts a new allowance. Failed and over-limit turns
+are retained under `archive/rejected`, not automatically resubmitted.
+The context JSON is capped at **12,000 UTF-8 bytes**, preserving the live message
+and actor. Optional context is reduced as whole items. Console token totals are
+heuristic context estimates, not provider usage or billed tokens.
+Event payload logging is opt-in via `--verbose-events`.
 
 ## OpenAI provider (opt-in)
 
@@ -106,13 +122,17 @@ only in the process environment:
 ```bash
 export OPENAI_API_KEY="..."
 export PLUMBMATE_OPENAI_MODEL="your-supported-model-id"
-PYTHONPATH=companion/src python3 -m plumbmate.cli serve \
+python -m plumbmate.cli serve \
   --bridge .plumbmate --provider openai
 ```
 
 The model is intentionally not hard-coded. This avoids silently switching cost
-or behavior when model availability changes. Requests use `store: false`; local
-compact memory will remain the source of continuity.
+or behavior when model availability changes. Requests use `store: false`.
+Persistent RP memory restoration is currently **disabled** until save-scope
+receipts are connected; model-generated memory patches are not stored as facts.
+Retrieval, model routing, actual usage accounting, and daily currency limits are
+future work, not completed features. See [current architecture](docs/ARCHITECTURE.md)
+and [UX/context review](docs/UX_CONTEXT_REVIEW_2026-09-06_KO.md).
 
 ## Build the game-side archive
 

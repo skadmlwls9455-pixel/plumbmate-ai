@@ -94,7 +94,9 @@ _ALREADY_CONNECTED = _errno_set("EISCONN", "WSAEISCONN")
 def _is_loopback(host):
     """Accept only a literal 127.0.0.0/8 address; this client is AF_INET."""
     parts = host.split(".") if isinstance(host, str) else []
-    if len(parts) != 4 or not all(part.isdigit() and len(part) <= 3 for part in parts):
+    if len(parts) != 4 or not all(
+            1 <= len(part) <= 3 and all("0" <= digit <= "9" for digit in part)
+            and (len(part) == 1 or part[0] != "0") for part in parts):
         return False
     octets = [int(part) for part in parts]
     return octets[0] == 127 and all(0 <= octet <= 255 for octet in octets)
