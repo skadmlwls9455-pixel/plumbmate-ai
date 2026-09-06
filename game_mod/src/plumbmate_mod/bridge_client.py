@@ -52,6 +52,12 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 30.0
+# Must stay well under the companion's idle timeout (300s), or a quiet game
+# session cycles through disconnect/reconnect every idle-timeout forever.
+KEEPALIVE_INTERVAL_SECONDS = 120.0
+# An ack that never arrives means the link is wedged even though the socket
+# looks open; after this long it is treated like any other failure.
+ACK_TIMEOUT_SECONDS = 30.0
 
 # Must stay identical to the companion's transport allow list. It bounds what
 # the socket carries and says nothing about whether an event may be acted on.
@@ -142,6 +148,8 @@ class BridgeClient(object):
         max_backoff=MAX_BACKOFF_SECONDS,
         max_outbox=MAX_OUTBOX_EVENTS,
         max_frame_bytes=MAX_FRAME_BYTES,
+        keepalive_interval=KEEPALIVE_INTERVAL_SECONDS,
+        ack_timeout=ACK_TIMEOUT_SECONDS,
     ):
         if not isinstance(token, str) or len(token.strip()) < MIN_TOKEN_CHARACTERS:
             raise ValueError(
@@ -161,6 +169,12 @@ class BridgeClient(object):
         self._max_backoff = max_backoff
         self._max_outbox = max_outbox
         self._max_frame_bytes = max_frame_bytes
+        self._keepalive_interval = float(keepalive_interval)
+        self._ack_timeout = float(ack_timeout)
+        self._next_keepalive = 0.0
+        # event_id -> monotonic time it was handed to the socket. Kept apart
+        # from _pending (a plain id list) so tests can still seed that list.
+        self._pending_sent_at = {}
 
         self.state = DISCONNECTED
         self.last_error = None
@@ -214,6 +228,24 @@ class BridgeClient(object):
         self.stats["queued_events"] += 1
         return frame["event_id"]
 
+    def adopt_outbox(self, other):
+        """Move another client's queued-but-unsent events into this outbox.
+
+        Used when a client is replaced (explicit restart): the old client's
+        in-flight events are lost by design (at-most-once), but events that
+        were never sent carry no duplication risk and would otherwise vanish
+        with the discarded object. Entries that do not fit stay on ``other``
+        and are counted as rejected here.
+        """
+        adopted = 0
+        while other._outbox and len(self._outbox) < self._max_outbox:
+            self._outbox.append(other._outbox.pop(0))
+            adopted += 1
+        if other._outbox:
+            self.stats["rejected_by_outbox"] += len(other._outbox)
+        self.stats["queued_events"] += adopted
+        return adopted
+
     def pump(self):
         """Advance the connection by a bounded step; never blocks, never raises."""
         try:
@@ -227,6 +259,7 @@ class BridgeClient(object):
         """Release the socket. Queued events are kept; in-flight ones are lost."""
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
+        self._pending_sent_at = {}
         self._close_socket()
         self._inbound = bytearray()
         self._outbound = bytearray()
@@ -261,9 +294,34 @@ class BridgeClient(object):
             return
         self._read_frames()
         if self.state == READY:
-            self._encode_outbox()
+            self._check_ack_deadline(now)
+        if self.state == READY:
+            self._maybe_keepalive(now)
+            self._encode_outbox(now)
         if self._socket is not None:
             self._flush_outbound()
+
+    def _check_ack_deadline(self, now):
+        """A sent event whose ack is overdue means the link is wedged."""
+        if self._ack_timeout <= 0:
+            return
+        for sent_at in self._pending_sent_at.values():
+            if now - sent_at > self._ack_timeout:
+                self._fail("ack_timeout")
+                return
+
+    def _maybe_keepalive(self, now):
+        """Queue a heartbeat so an idle connection outlives the server's idle
+        timeout. Any traffic resets that timeout, so nothing is queued while
+        real events are flowing; an interval of 0 disables keepalives."""
+        if self._keepalive_interval <= 0:
+            return
+        if self._outbox or self._pending or self._outbound:
+            self._next_keepalive = now + self._keepalive_interval
+            return
+        if now >= self._next_keepalive:
+            self.queue_event("heartbeat", {"source": "keepalive"})
+            self._next_keepalive = now + self._keepalive_interval
 
     def _start_connect(self, now):
         self._close_socket()
@@ -360,6 +418,7 @@ class BridgeClient(object):
             self.state = READY
             self._backoff = 0.0
             self.last_error = None
+            self._next_keepalive = self._now() + self._keepalive_interval
             self.stats["handshakes"] += 1
         elif self.state == READY:
             if kind == "ack":
@@ -374,6 +433,7 @@ class BridgeClient(object):
             self.stats["unknown_frames"] += 1
             return
         self._pending.remove(event_id)
+        self._pending_sent_at.pop(event_id, None)
         if accepted:
             self.stats["acked_events"] += 1
         else:
@@ -381,13 +441,14 @@ class BridgeClient(object):
             self.stats["refused_events"] += 1
             self.last_error = reason
 
-    def _encode_outbox(self):
+    def _encode_outbox(self, now):
         while self._outbox and len(self._pending) < MAX_PENDING_ACKS:
             if len(self._outbound) >= MAX_WRITE_BYTES_PER_PUMP:
                 return
             event_id, encoded = self._outbox.pop(0)
             self._outbound.extend(encoded)
             self._pending.append(event_id)
+            self._pending_sent_at[event_id] = now
             self.stats["sent_events"] += 1
 
     def _write_frame(self, value):
@@ -414,6 +475,7 @@ class BridgeClient(object):
         # In-flight events have an unknown outcome and are never resent.
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
+        self._pending_sent_at = {}
         self.last_error = reason
         self._close_socket()
         self._inbound = bytearray()

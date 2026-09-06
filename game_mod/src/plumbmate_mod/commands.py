@@ -302,6 +302,9 @@ def plumbmate_bridge_start(_connection=None):
         plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
         previous = TICK_DRIVER.detach()
         if previous is not None:
+            # Events queued but never sent carry no duplication risk; they
+            # follow the replacement instead of vanishing with the old client.
+            client.adopt_outbox(previous)
             previous.close()
         _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT = client, endpoint
         TICK_DRIVER.attach(client)

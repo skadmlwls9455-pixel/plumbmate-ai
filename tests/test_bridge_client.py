@@ -385,5 +385,152 @@ class BackpressureInteropTests(InteropHarness):
         self.assertEqual(self.client.awaiting_ack, 0)
 
 
+
+class KeepaliveTests(unittest.TestCase):
+    """An idle READY connection must outlive the companion's idle timeout."""
+
+    def _ready_client(self, **kwargs):
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        clock = Clock()
+        client = bridge.BridgeClient(
+            TOKEN, server.port, now=clock,
+            connect_timeout=30.0, handshake_timeout=30.0, **kwargs,
+        )
+        self.addCleanup(client.close)
+        self.assertTrue(pump_until(client, lambda: client.connected))
+        return server, clock, client
+
+    def test_idle_ready_connection_sends_a_keepalive_heartbeat(self):
+        server, clock, client = self._ready_client()
+        self.assertEqual(client.stats["queued_events"], 0)
+        clock.advance(bridge.KEEPALIVE_INTERVAL_SECONDS + 1.0)
+        self.assertTrue(
+            pump_until(client, lambda: client.stats["acked_events"] == 1),
+            "keepalive was never sent or acked: {}".format(client.last_error),
+        )
+        event = server.poll(timeout=15.0)
+        self.assertEqual(event.kind, "heartbeat")
+        self.assertEqual(event.payload, {"source": "keepalive"})
+
+    def test_zero_interval_disables_keepalives(self):
+        import time as time_module
+        _server, clock, client = self._ready_client(keepalive_interval=0)
+        clock.advance(10000.0)
+        for _ in range(20):
+            client.pump()
+            time_module.sleep(0.005)
+        self.assertEqual(client.stats["queued_events"], 0)
+        self.assertTrue(client.connected)
+
+
+class AckDeadlineTests(unittest.TestCase):
+    """A sent event whose ack never arrives means the link is wedged."""
+
+    def test_overdue_ack_fails_the_connection(self):
+        import errno as errno_module
+        clock = Clock()
+        client = bridge.BridgeClient(TOKEN, closed_port(), now=clock, ack_timeout=30.0)
+        self.addCleanup(client.close)
+
+        class SilentSocket(object):
+            def recv(self, _size):
+                raise OSError(errno_module.EAGAIN, "nothing ever arrives")
+
+            def send(self, data):
+                return len(data)
+
+            def close(self):
+                pass
+
+        client._socket = SilentSocket()
+        client.state = bridge.READY
+        client._next_keepalive = clock.value + 10000.0
+        client.queue_event("heartbeat", {"index": 1})
+        client.pump()
+        self.assertEqual(client.awaiting_ack, 1)
+        clock.advance(29.0)
+        client.pump()
+        self.assertEqual(client.state, bridge.READY)
+        clock.advance(2.0)
+        client.pump()
+        self.assertEqual(client.state, bridge.BACKOFF)
+        self.assertEqual(client.last_error, "ack_timeout")
+        self.assertEqual(client.stats["lost_events"], 1)
+        self.assertEqual(client.awaiting_ack, 0)
+
+    def test_zero_ack_timeout_disables_the_deadline(self):
+        import errno as errno_module
+        clock = Clock()
+        client = bridge.BridgeClient(TOKEN, closed_port(), now=clock, ack_timeout=0)
+        self.addCleanup(client.close)
+
+        class SilentSocket(object):
+            def recv(self, _size):
+                raise OSError(errno_module.EAGAIN, "nothing ever arrives")
+
+            def send(self, data):
+                return len(data)
+
+            def close(self):
+                pass
+
+        client._socket = SilentSocket()
+        client.state = bridge.READY
+        client._next_keepalive = clock.value + 10000.0
+        client.queue_event("heartbeat")
+        client.pump()
+        clock.advance(100000.0)
+        client.pump()
+        self.assertEqual(client.state, bridge.READY)
+
+
+class AdoptOutboxTests(unittest.TestCase):
+    """A replacement client takes over the old client's unsent events."""
+
+    def test_unsent_events_move_to_the_replacement(self):
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        new = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(old.close)
+        self.addCleanup(new.close)
+        for index in range(3):
+            self.assertIsNotNone(old.queue_event("heartbeat", {"index": index}))
+        self.assertEqual(new.adopt_outbox(old), 3)
+        self.assertEqual(old.queued, 0)
+        self.assertEqual(new.queued, 3)
+
+    def test_overflow_stays_behind_and_is_counted(self):
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        new = bridge.BridgeClient(TOKEN, closed_port(), max_outbox=2)
+        self.addCleanup(old.close)
+        self.addCleanup(new.close)
+        for index in range(5):
+            old.queue_event("heartbeat", {"index": index})
+        self.assertEqual(new.adopt_outbox(old), 2)
+        self.assertEqual(old.queued, 3)
+        self.assertEqual(new.queued, 2)
+        self.assertEqual(new.stats["rejected_by_outbox"], 3)
+
+    def test_adopted_events_reach_the_server_in_order(self):
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(old.close)
+        ids = [old.queue_event("heartbeat", {"index": index}) for index in range(3)]
+        new = bridge.BridgeClient(
+            TOKEN, server.port, connect_timeout=30.0, handshake_timeout=30.0,
+        )
+        self.addCleanup(new.close)
+        self.assertEqual(new.adopt_outbox(old), 3)
+        self.assertTrue(
+            pump_until(new, lambda: new.stats["acked_events"] == 3),
+            "adopted events were never acked: {}".format(new.last_error),
+        )
+        received = [server.poll(timeout=15.0).event_id for _ in range(3)]
+        self.assertEqual(received, ids)
+
+
 if __name__ == "__main__":
     unittest.main()
