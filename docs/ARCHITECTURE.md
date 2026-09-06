@@ -15,6 +15,7 @@ Updated 2026-09-06. The master RFC map describes a target, not shipped behavior.
 - `companion/turn_status.py`: best-effort non-narrative processing/failure receipts, not a transactional action/save ledger.
 - `companion/event_socket.py`: loopback listener and pure-Python companion workers. Settings/framing/server can be separated later; no game APIs are called by workers.
 - `companion/cli.py`: configuration, service loops, and human-readable progress. Attempt accounting is owned by the engine, not duplicated per command.
+- `companion/memory.py` + `memory_text.py`: SQLite memory store (provenance-tagged rows, rule-based recall with a per-turn `retrieval_log`, single tunable weight row). Recording is default, recall is opt-in per session_id until save receipts exist. Never imported by game code.
 
 ## Boundaries that must remain true
 
@@ -22,7 +23,7 @@ Updated 2026-09-06. The master RFC map describes a target, not shipped behavior.
 2. Game ticks perform bounded nonblocking socket work, not file polling, model calls, or background EA API calls. Endpoint files are persistent configuration, not liveness signals.
 3. No field outside the request schema reaches a provider. Model output cannot override request identifiers or introduce executable commands. A syntactically valid action is still only a suggestion in this prototype.
 4. Final responses are validated *after* local transforms. Game reads match the specific request ID; global newest-response lookup is only a developer CLI tool.
-5. Unknown save scope means no persistent RP memory restoration. Model-generated patches are not promoted to observed facts. Existing session files are preserved but ignored.
+5. Unknown save scope means no persistent RP memory restoration by default. The memory store records under the request's `session_id`; feeding recalled rows back into a turn is an explicit `--recall` opt-in, labeled as unverified scope. Model-generated patches are not promoted to observed facts. Existing session files are preserved but ignored.
 6. API uncertainty does not trigger automatic retries during normal single-engine processing. Connection retries are independent from paid model retries.
 7. Sequential server lifecycle control: stop admissions before sweeping connections. Retain timed-out worker references and refuse restart while old workers survive.
 
@@ -45,7 +46,7 @@ play text; retention, export, deletion UI, and disk quotas remain release work.
 ## Not implemented yet
 
 The autonomous NPC-like partner, selected partner binding, observed event
-atomization, verified save/branch receipts, memory DB/retrieval, L0–L3 router,
+atomization, verified save/branch receipts, memory consolidation/reflection, L0–L3 router,
 IC scheduler, and relationship features remain separate milestones. Pure
 save-lineage and state-delta helpers exist but are not proof of end-to-end use.
 

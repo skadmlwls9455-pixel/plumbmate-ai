@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .engine import CompanionEngine
+from .memory import MemoryStore
 from .event_socket import (
     ALLOWED_EVENT_KINDS,
     BridgeClient,
@@ -76,7 +77,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     commands = (
         "init", "demo", "serve-once", "serve", "show-latest",
-        "token", "listen", "run", "mock-event",
+        "token", "listen", "run", "mock-event", "memory-search", "memory-stats",
     )
     for command in commands:
         sub = subparsers.add_parser(command)
@@ -98,6 +99,19 @@ def _main(argv: list[str] | None = None) -> int:
         if command in {"serve-once", "serve", "run"}:
             sub.add_argument("--max-turns", type=int, default=20,
                              help="Maximum model attempts this session; no silent automatic retries")
+            sub.add_argument("--recall", action="store_true",
+                             help="Feed retrieved memories into memory_summary (session-scoped, "
+                                  "save scope is NOT verified; off by default)")
+        if command in {"serve-once", "serve", "run", "listen", "memory-search", "memory-stats"}:
+            sub.add_argument("--memory-db", default=None,
+                             help="SQLite path (default: <bridge>/state/memory.sqlite3)")
+        if command in {"serve-once", "serve", "run", "listen"}:
+            sub.add_argument("--no-memory", action="store_true",
+                             help="Do not record turns/events into the memory store")
+        if command == "memory-search":
+            sub.add_argument("--query", required=True, help="Free text to score against stored memories")
+            sub.add_argument("--session", default=None, help="Restrict to one session_id")
+            sub.add_argument("--limit", type=int, default=10)
         if command == "mock-event":
             sub.add_argument("--port", type=int, required=True)
             sub.add_argument("--kind", choices=sorted(ALLOWED_EVENT_KINDS), default="heartbeat")
@@ -106,6 +120,25 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = bridge_from(args.bridge)
     paths.ensure()
+
+    def open_memory() -> MemoryStore | None:
+        if getattr(args, "no_memory", False):
+            return None
+        target = getattr(args, "memory_db", None) or (paths.state / "memory.sqlite3")
+        return MemoryStore(target)
+
+    if args.command == "memory-stats":
+        with open_memory() as memory:
+            print(json.dumps(memory.stats(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "memory-search":
+        with open_memory() as memory:
+            for item in memory.search(args.query, session_id=args.session, limit=args.limit):
+                print(json.dumps({"memory_id": item.memory_id, "score": item.score, "type": item.memory_type,
+                                  "provenance": item.provenance, "summary": item.summary,
+                                  "reason": item.reason, "breakdown": item.breakdown},
+                                 ensure_ascii=False), flush=True)
+        return 0
 
     if args.command == "init":
         print(paths.root)
@@ -117,19 +150,27 @@ def _main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
     if args.command in {"serve-once", "serve"}:
-        engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
-        if args.command == "serve-once":
-            result = _process_turn(engine, fail_on_error=True)
-            if result is None:
-                print("no completed turn; check pending requests or turn status")
-            return 0
+        memory = open_memory()
+        engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns,
+                                 memory=memory, recall=args.recall)
+        if args.recall:
+            print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         try:
-            while True:
-                result = _process_turn(engine)
+            if args.command == "serve-once":
+                result = _process_turn(engine, fail_on_error=True)
                 if result is None:
-                    time.sleep(max(0.1, args.interval))
-        except KeyboardInterrupt:
-            return 0
+                    print("no completed turn; check pending requests or turn status")
+                return 0
+            try:
+                while True:
+                    result = _process_turn(engine)
+                    if result is None:
+                        time.sleep(max(0.1, args.interval))
+            except KeyboardInterrupt:
+                return 0
+        finally:
+            if memory is not None:
+                memory.close()
     if args.command == "token":
         target = token_path(paths)
         if args.rotate or not target.exists():
@@ -138,11 +179,15 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     if args.command in {"listen", "run"}:
         engine = None
+        memory = open_memory()
         if args.command == "run":
             if args.max_turns < 1:
                 print("--max-turns must be positive")
                 return 2
-            engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
+            engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns,
+                                     memory=memory, recall=args.recall)
+            if args.recall:
+                print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         # The socket layer is loopback-only and refuses to start without a token.
         try:
             server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port))
@@ -167,6 +212,11 @@ def _main(argv: list[str] | None = None) -> int:
                     if event is None:
                         continue
                     seen += 1
+                    if memory is not None:
+                        try:
+                            memory.remember_event(event.kind, event.payload)
+                        except Exception as exc:
+                            print(f"memory: event not stored ({type(exc).__name__})", flush=True)
                     summary = {"kind": event.kind, "event_id": event.event_id, "received_at": event.received_at}
                     if args.verbose_events:
                         summary["payload"] = event.payload
@@ -175,6 +225,8 @@ def _main(argv: list[str] | None = None) -> int:
                 pass
         finally:
             server.stop()
+            if memory is not None:
+                memory.close()
             # Keep configuration: a later launch must reach the same endpoint
             # cached by the game, without disk polling on the engine thread.
         return 0

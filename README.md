@@ -68,6 +68,35 @@ answer to the server's nonce; the token itself is never sent.
 See [bridge reliability fixes and verification](docs/BRIDGE_FIXES_2026-09-05_KO.md)
 for the four reviewed defects, regression coverage, and remaining in-game checks.
 
+## Memory (Phase 1 slice)
+
+The companion keeps a local SQLite memory (`state/memory.sqlite3`) of what
+passed through it: the player's lines, the companion's replies, adapter-reported
+`recent_events`, and socket events. Each row carries a provenance
+(`game_observed`, `bridge_observed`, `player_canon`, `ai_inferred`) and nothing
+is ever promoted or deleted by the store itself; `ai_inferred` rows are capped
+at confidence 0.9 by the schema.
+
+Recording is on by default (`--no-memory` turns it off). **Recall is opt-in**:
+`--recall` scores candidates with a rule-based formula (keyword coverage,
+entity overlap, importance, recency, open promises), picks at most six, packs
+them into `memory_summary` within the 12 KB context budget, and writes why each
+candidate was or was not chosen to `retrieval_log`. Rows are keyed by the
+request's `session_id`; save scope is not verified yet, which is why recall is
+not the default. Events without a session are stored for audit only and never
+recalled.
+
+```bash
+python -m plumbmate.cli run --bridge .plumbmate --provider mock --recall
+python -m plumbmate.cli memory-search --bridge .plumbmate --query "뒷마당 불"
+python -m plumbmate.cli memory-stats --bridge .plumbmate
+```
+
+No embeddings and no extra model calls are involved. Korean keywords are
+matched after rule-based particle stripping, so paraphrases and inflections
+can be missed; `retrieval_log` is the place to measure that before deciding on
+embeddings.
+
 ## Repository layout
 
 ```text
