@@ -15,6 +15,7 @@ Updated 2026-09-06. The master RFC map describes a target, not shipped behavior.
 - `companion/turn_status.py`: best-effort non-narrative processing/failure receipts, not a transactional action/save ledger.
 - `companion/event_socket.py`: loopback listener and pure-Python companion workers. Settings/framing/server can be separated later; no game APIs are called by workers.
 - `companion/cli.py`: configuration, service loops, and human-readable progress. Attempt accounting is owned by the engine, not duplicated per command.
+- `companion/drives.py`: homeostatic urgency from `actor.motives` and the bounded `drive_state` line the engine adds to a request. Pure function; no model, no action decisions.
 - `companion/memory.py` + `memory_text.py`: SQLite memory store (provenance-tagged rows, rule-based recall with a per-turn `retrieval_log`, single tunable weight row). Recording is default, recall is opt-in per session_id until save receipts exist. Never imported by game code.
 
 ## Boundaries that must remain true

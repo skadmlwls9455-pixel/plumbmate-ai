@@ -97,6 +97,17 @@ matched after rule-based particle stripping, so paraphrases and inflections
 can be missed; `retrieval_log` is the place to measure that before deciding on
 embeddings.
 
+## Needs and mood (Phase 2a slice)
+
+The game snapshot may carry `actor.motives` (the six motive bars, -100 to 100)
+and `actor.buffs`. The companion turns them into one deterministic line,
+`drive_state` (e.g. `욕구: 배고픔 높음 | 기분: Mood_Happy`), using a homeostatic
+rule: urgency is the distance below a set point, nothing else. The line is part
+of the request contract, so the provider sees it; the mock provider's suggestion
+follows the most pressing need, which is how the behaviour is tested. Reading
+motives in-game uses the statistic manager and is guarded: a lookup that fails
+drops the field, never the turn, and is **not yet verified in the real game**.
+
 ## Repository layout
 
 ```text

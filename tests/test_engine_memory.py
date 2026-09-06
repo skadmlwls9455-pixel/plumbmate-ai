@@ -117,5 +117,57 @@ class EngineMemoryTests(unittest.TestCase):
             self.assertLessEqual(summary.count("\n") + 1, 6)
 
 
+class DriveStateTests(unittest.TestCase):
+    """The companion's needs reach the provider as one bounded line and change
+    the mock's suggestion — the Phase 2a acceptance test."""
+
+    def setUp(self):
+        temporary = tempfile.mkdtemp(prefix="plumbmate-engine-drives-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(temporary, True))
+        self.paths = BridgePaths(Path(temporary))
+        self.paths.ensure()
+
+    def turn(self, motives=None, mood=None):
+        actor = {"sim_id": 1, "name": "케이트"}
+        if motives is not None:
+            actor["motives"] = motives
+        if mood is not None:
+            actor["mood"] = mood
+        request = {
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": uuid.uuid4().hex,
+            "kind": "turn",
+            "created_at": "2026-09-06T00:00:00+00:00",
+            "player_message": "오늘 뭐 할까?",
+            "session_id": "household-1",
+            "actor": actor,
+        }
+        atomic_write_json(self.paths.requests / f"{request['request_id']}.json", request)
+        return request
+
+    def test_drive_state_is_injected_only_when_the_snapshot_has_needs(self):
+        spy = SpyProvider()
+        engine = CompanionEngine(self.paths, spy)
+        self.turn()
+        engine.process_one()
+        self.assertNotIn("drive_state", spy.requests[0])
+        self.turn(motives={"hunger": -60, "energy": 80}, mood="Mood_Happy")
+        engine.process_one()
+        self.assertEqual(spy.requests[1]["drive_state"], "욕구: 배고픔 높음 | 기분: Mood_Happy")
+
+    def test_a_hungry_companion_and_a_full_one_get_different_suggestions(self):
+        spy = SpyProvider()
+        engine = CompanionEngine(self.paths, spy)
+        self.turn(motives={"hunger": -70, "fun": 60})
+        hungry = engine.process_one()
+        self.turn(motives={"hunger": 90, "fun": 60})
+        full = engine.process_one()
+        import json as json_module
+        hungry_idea = json_module.loads(hungry.read_text(encoding="utf-8"))["action"]["arguments"]["idea"]
+        full_idea = json_module.loads(full.read_text(encoding="utf-8"))["action"]["arguments"]["idea"]
+        self.assertIn("먹자", hungry_idea)
+        self.assertNotEqual(hungry_idea, full_idea)
+
+
 if __name__ == "__main__":
     unittest.main()

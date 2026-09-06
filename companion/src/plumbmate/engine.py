@@ -16,6 +16,7 @@ from .protocol import (
     validate_request,
     validate_response,
 )
+from .drives import describe as describe_drives
 from .memory import MemoryStore
 from .providers import Provider
 from .turn_status import write_turn_status
@@ -76,6 +77,12 @@ class CompanionEngine:
                     summary = self._memory_call(self.memory.recall_summary, request)
                     request["memory_summary"] = summary or ""
                     self.last_recall_lines = summary.count("\n") + 1 if summary else 0
+                actor = request.get("actor") or {}
+                state = describe_drives(actor.get("motives"), actor.get("buffs"), actor.get("mood"))
+                if state:
+                    request["drive_state"] = state
+                else:
+                    request.pop("drive_state", None)
                 request = clamp_request(request)
             except ProtocolError:
                 write_turn_status(self.paths, request_path.stem, "failed", "invalid_request")
