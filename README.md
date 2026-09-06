@@ -97,6 +97,37 @@ matched after rule-based particle stripping, so paraphrases and inflections
 can be missed; `retrieval_log` is the place to measure that before deciding on
 embeddings.
 
+### Lifecycle and reflection (Phase 3 slice)
+
+Nothing in the store is rewritten in place. `memory-admin` exposes the
+transitions: `edit` supersedes a row, `delete` hides it and `purge-deleted`
+is the only physical delete, `pin` exempts a row from decay, merging and
+archiving, and `promote --evidence-kind player_confirm --evidence "..."` is the
+one gate from `ai_inferred` to canon (logged in `canon_promotions`; without
+evidence it is refused). An inference that flips a canon fact on the same
+subject lands as `disputed` and is never recalled.
+
+Between turns the engine runs a rule-based batch (every 20 completed turns by
+default, or `memory-admin maintain` by hand):
+
+- `consolidate` folds three or more identical observations within three days
+  into one "N회 반복" row; `archive` retires trivial rows nobody recalled in 90
+  days and unpromoted inferences after 60.
+- `summarize` writes one `relationship_summary` per sim pair from their shared
+  memories, at most weekly and only when new evidence arrived; the previous
+  summary is superseded. Fresh raw lines outrank it; it takes over as they
+  decay.
+- `reflect` writes one to three self-notes from what the session left
+  unresolved: a recall that found nothing, a promise open for three days, a
+  disputed guess. Notes carry trigger keywords and only surface when their
+  topic returns.
+
+Summaries and notes are `ai_inferred` (confidence 0.8 and 0.6), so they are
+labeled as the companion's own reading, rot on the inference TTL, and can
+become canon only through `promote`. The phrasing comes from a deterministic
+`RuleSummarizer`; a model-backed summarizer would implement the same two
+methods and cost one session attempt per call, and none exists yet.
+
 ## Needs and mood (Phase 2a slice)
 
 The game snapshot may carry `actor.motives` (the six motive bars, -100 to 100)

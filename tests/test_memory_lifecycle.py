@@ -107,6 +107,34 @@ class ArchiveTests(LifecycleHarness):
         self.assertIn(pinned, [r.memory_id for r in recalled])
         self.assertEqual(next(r for r in recalled if r.memory_id == pinned).breakdown["pin"], 1.5)
 
+    def test_disputed_guesses_expire_too(self):
+        self.store.add_memory(SESSION, "canon", "베라는 매운 음식을 싫어한다", provenance="player_canon")
+        guess = self.store.add_memory(SESSION, "sentiment", "베라는 매운 음식을 좋아한다",
+                                      provenance="ai_inferred", confidence=0.6)
+        self.assertEqual(self.status(guess), "disputed")
+        self.clock.advance(61 * DAY)
+        self.store.archive_stale()
+        self.assertEqual(self.status(guess), "archived")
+
+    def test_merged_summaries_are_not_merged_again(self):
+        for _ in range(9):
+            self.store.remember_event("zone_loaded", {"lot": "home", "session_id": SESSION})
+            self.clock.advance(3600)
+        self.assertEqual(self.store.consolidate(), 1)
+        self.assertEqual(self.store.consolidate(), 0)
+        active = [r for r in self.store.rows_of(SESSION, event_kind="zone_loaded") if r["status"] == "active"]
+        self.assertEqual(len(active), 1)
+        self.assertIn("9회 반복", active[0]["summary"])
+
+    def test_editing_a_disputed_guess_rechecks_it(self):
+        self.store.add_memory(SESSION, "canon", "베라는 매운 음식을 싫어한다", provenance="player_canon")
+        guess = self.store.add_memory(SESSION, "sentiment", "베라는 매운 음식을 좋아한다",
+                                      provenance="ai_inferred", confidence=0.6)
+        fixed = self.store.edit(guess, "베라는 낚시를 좋아한다")
+        self.assertEqual(self.status(fixed), "active")
+        still_wrong = self.store.edit(fixed, "베라는 매운 음식을 좋아한다")
+        self.assertEqual(self.status(still_wrong), "disputed")
+
     def test_recalled_rows_are_not_archived(self):
         row = self.store.add_memory(SESSION, "episodic", "케이트와 산책했다", importance=1)
         self.store.recall(request("케이트 산책"))

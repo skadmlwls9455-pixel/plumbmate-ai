@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .engine import CompanionEngine
 from .memory import MemoryStore
+from .reflection import maintain, reflect, refresh_relationship_summaries
 from .event_socket import (
     ALLOWED_EVENT_KINDS,
     BridgeClient,
@@ -111,12 +112,14 @@ def _main(argv: list[str] | None = None) -> int:
                              help="Do not record turns/events into the memory store")
         if command == "memory-admin":
             sub.add_argument("action", choices=(
-                "show", "pin", "unpin", "edit", "delete", "purge-deleted", "promote", "consolidate", "archive"))
+                "show", "pin", "unpin", "edit", "delete", "purge-deleted", "promote", "consolidate", "archive",
+                "summarize", "reflect", "maintain"))
             sub.add_argument("--id", type=int, default=None, help="memory_id for show/pin/unpin/edit/delete/promote")
             sub.add_argument("--summary", default=None, help="edit: replacement text (old row is superseded)")
             sub.add_argument("--evidence-kind", choices=("player_confirm", "game_event"), default=None)
             sub.add_argument("--evidence", default=None, help="promote: the confirmation text or game event id")
-            sub.add_argument("--session", default=None, help="consolidate: restrict to one session_id")
+            sub.add_argument("--session", default=None,
+                             help="consolidate/summarize/reflect/maintain: restrict to one session_id")
         if command == "memory-search":
             sub.add_argument("--query", required=True, help="Free text to score against stored memories")
             sub.add_argument("--session", default=None, help="Restrict to one session_id")
@@ -178,6 +181,15 @@ def _main(argv: list[str] | None = None) -> int:
                     print(f"merged groups: {memory.consolidate(args.session)}")
                 elif args.action == "archive":
                     print(f"archived: {memory.archive_stale()}")
+                elif args.action in {"summarize", "reflect"}:
+                    job = refresh_relationship_summaries if args.action == "summarize" else reflect
+                    sessions = [args.session] if args.session else memory.sessions()
+                    for scope in sessions:
+                        for memory_id in job(memory, scope):
+                            row = memory.get(memory_id) or {}
+                            print(f"{scope} #{memory_id}: {row.get('summary', '')}")
+                elif args.action == "maintain":
+                    print(json.dumps(maintain(memory, args.session), ensure_ascii=False))
             except (KeyError, ValueError) as exc:
                 print("memory-admin: " + str(exc))
                 return 2

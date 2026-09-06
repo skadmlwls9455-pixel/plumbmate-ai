@@ -66,7 +66,10 @@ ARCHIVE_MAX_IMPORTANCE = 2
 INFERENCE_TTL_DAYS = 60.0
 # Repeated *identical* observations are worth folding; distinct utterances are
 # not, so chat turns and adapter-reported events are never merged.
-UNMERGEABLE_EVENT_KINDS = frozenset(("chat_turn", "chat_reply", "recent_event"))
+UNMERGEABLE_EVENT_KINDS = frozenset(("chat_turn", "chat_reply", "recent_event", "reflection"))
+# Derived rows restate observed evidence; the canon-contradiction heuristic
+# would quarantine a whole summary for one quoted line, so they skip it.
+DERIVED_KINDS = frozenset(("reflection", "relationship_summary"))
 EVIDENCE_KINDS = ("player_confirm", "game_event")
 # Contradiction heuristic for ai_inferred rows: high keyword overlap with a
 # canon row plus an opposing polarity token. Deliberately narrow — it must
@@ -150,6 +153,15 @@ CREATE TABLE IF NOT EXISTS retrieval_log (
   created_at REAL NOT NULL,
   PRIMARY KEY (turn_id, memory_id)
 );
+CREATE TABLE IF NOT EXISTS retrieval_turns (
+  turn_id    TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  query      TEXT NOT NULL,
+  candidates INTEGER NOT NULL,
+  selected   INTEGER NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rt_session ON retrieval_turns(session_id, created_at);
 CREATE TABLE IF NOT EXISTS canon_promotions (
   memory_id      INTEGER NOT NULL REFERENCES memories(memory_id),
   old_provenance TEXT NOT NULL,
@@ -309,6 +321,7 @@ class MemoryStore:
         trigger_keywords: list[str] | None = None,
         pinned: bool = False,
         created_at: float | None = None,
+        source_ids: list[int] | None = None,
     ) -> int:
         if memory_type not in MEMORY_TYPES:
             raise ValueError("Unknown memory type: " + memory_type)
@@ -320,12 +333,13 @@ class MemoryStore:
         keywords = tokenize(summary + " " + (details or ""))
         cursor = self._db.execute(
             "INSERT INTO memories (session_id, memory_type, provenance, confidence, importance,"
-            " status, pinned, event_kind, summary, details, keywords, trigger_keywords, created_at_real)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " status, pinned, event_kind, summary, details, keywords, trigger_keywords, created_at_real,"
+            " source_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, memory_type, provenance, float(confidence), int(max(1, min(10, importance))),
              status, 1 if pinned else 0, event_kind, summary, details, " ".join(keywords),
              json.dumps(trigger_keywords, ensure_ascii=False) if trigger_keywords else None,
-             self._now() if created_at is None else float(created_at)),
+             self._now() if created_at is None else float(created_at),
+             json.dumps([int(i) for i in source_ids]) if source_ids else None),
         )
         memory_id = int(cursor.lastrowid)
         if self.fts_available:
@@ -341,7 +355,8 @@ class MemoryStore:
                 "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, role) VALUES (?,?,?)",
                 (memory_id, entity_id, role),
             )
-        if provenance == "ai_inferred" and status == "active":
+        derived = memory_type in DERIVED_KINDS or event_kind in DERIVED_KINDS
+        if provenance == "ai_inferred" and status == "active" and not derived:
             conflict = self._contradicts_canon(session_id, keywords)
             if conflict is not None:
                 # Quarantined, not deleted: it stays inspectable but never recalled.
@@ -461,7 +476,14 @@ class MemoryStore:
         scored = [item for item in scored if item.summary not in already_in_request]
         selected = self._select(scored)
         if log:
-            self._log(str(request.get("request_id") or "unknown"), scored, selected)
+            turn_id = str(request.get("request_id") or "unknown")
+            self._log(turn_id, scored, selected)
+            self._db.execute(
+                "INSERT OR REPLACE INTO retrieval_turns (turn_id, session_id, query, candidates, selected, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (turn_id, session_id, clip(query_text, MAX_LINE_CHARS), len(scored), len(selected), self._now()),
+            )
+            self._db.commit()
         return selected
 
     def recall_summary(self, request: dict[str, Any]) -> str:
@@ -541,11 +563,13 @@ class MemoryStore:
             imp = row["importance"] / 10.0
             rec = self._recency(row, now)
             open_score = 0.0
+            triggers = json.loads(row["trigger_keywords"]) if row["trigger_keywords"] else []
+            triggered = any(str(trigger).lower() in tokens for trigger in triggers)
             if row["memory_type"] == "promise" and row["status"] == "open":
+                open_score = 1.5 if triggered else 1.0
+            elif row["event_kind"] == "reflection" and triggered:
+                # A self-note earns its slot only when its topic comes back.
                 open_score = 1.0
-                triggers = json.loads(row["trigger_keywords"]) if row["trigger_keywords"] else []
-                if any(str(trigger).lower() in tokens for trigger in triggers):
-                    open_score = 1.5
             loc = 0.0
             conf = float(row["confidence"]) if row["provenance"] == "ai_inferred" else 1.0
             score = conf * (
@@ -557,7 +581,7 @@ class MemoryStore:
                          "pin": config["pin_bonus"] if row["pinned"] else 0.0}
             scored.append(Recalled(
                 memory_id, row["memory_type"], row["provenance"], row["summary"],
-                round(score, 4), breakdown, _reason(breakdown),
+                round(score, 4), breakdown, _reason(breakdown, row["event_kind"]),
             ))
         scored.sort(key=lambda item: (-item.score, item.memory_id))
         return [item for item in scored if item.score >= floor]
@@ -637,10 +661,12 @@ class MemoryStore:
             raise ValueError(f"Memory {memory_id} is {old['status']} and cannot be edited")
         links = {int(r["entity_id"]): r["role"] for r in self._db.execute(
             "SELECT entity_id, role FROM memory_entities WHERE memory_id = ?", (memory_id,))}
+        # A corrected guess starts over as active and is re-checked against canon.
+        status = "active" if old["status"] == "disputed" else old["status"]
         new_id = self.add_memory(
             old["session_id"], old["memory_type"], summary,
             provenance=old["provenance"], importance=old["importance"], confidence=old["confidence"],
-            event_kind=old["event_kind"], status=old["status"], entities=links,
+            event_kind=old["event_kind"], status=status, entities=links,
             details=details if details is not None else old["details"],
             trigger_keywords=json.loads(old["trigger_keywords"]) if old["trigger_keywords"] else None,
             pinned=bool(old["pinned"]), created_at=old["created_at_real"],
@@ -719,7 +745,8 @@ class MemoryStore:
             "SELECT memory_id, session_id, event_kind, summary, provenance, importance, created_at_real"
             " FROM memories WHERE status = 'active' AND memory_type = 'episodic' AND pinned = 0"
             " AND provenance != 'ai_inferred' AND event_kind IS NOT NULL AND merged_into IS NULL"
-            " AND (? IS NULL OR session_id = ?) ORDER BY created_at_real", (session_id, session_id),
+            " AND source_ids IS NULL AND (? IS NULL OR session_id = ?) ORDER BY created_at_real",
+            (session_id, session_id),
         ).fetchall()
         groups: dict[tuple, list[sqlite3.Row]] = {}
         for row in rows:
@@ -751,9 +778,8 @@ class MemoryStore:
         new_id = self.add_memory(
             scope, "episodic", f"{summary} — {len(batch)}회 반복", provenance=provenance,
             importance=max(int(r["importance"]) for r in batch), event_kind=kind, entities=links,
-            created_at=float(batch[-1]["created_at_real"]),
+            created_at=float(batch[-1]["created_at_real"]), source_ids=ids,
         )
-        self._db.execute("UPDATE memories SET source_ids = ? WHERE memory_id = ?", (json.dumps(ids), new_id))
         self._db.execute(
             f"UPDATE memories SET status = 'merged', merged_into = ? WHERE memory_id IN ({placeholders})",
             (new_id, *ids),
@@ -765,8 +791,8 @@ class MemoryStore:
                       max_importance: int = ARCHIVE_MAX_IMPORTANCE,
                       inference_ttl_days: float = INFERENCE_TTL_DAYS) -> int:
         """Retire what nobody recalled: low-importance old rows, and unpromoted
-        inferences past their TTL (RFC-001 §9.5: guesses rot). Pinned rows and
-        canon are never archived."""
+        inferences past their TTL (RFC-001 §9.5: guesses rot), disputed ones
+        included. Pinned rows and canon are never archived."""
         now = self._now()
         cursor = self._db.execute(
             "UPDATE memories SET status = 'archived' WHERE status = 'active' AND pinned = 0"
@@ -775,13 +801,106 @@ class MemoryStore:
         )
         archived = cursor.rowcount
         cursor = self._db.execute(
-            "UPDATE memories SET status = 'archived' WHERE status = 'active' AND pinned = 0"
+            "UPDATE memories SET status = 'archived' WHERE status IN ('active','disputed') AND pinned = 0"
             " AND provenance = 'ai_inferred' AND created_at_real <= ?",
             (now - inference_ttl_days * 86400.0,),
         )
         archived += cursor.rowcount
         self._db.commit()
         return archived
+
+    # ------------------------------------------------- batch cognition input
+
+    def sessions(self) -> list[str]:
+        """Session ids with recallable rows; the unscoped audit bucket is excluded."""
+        rows = self._db.execute(
+            "SELECT DISTINCT session_id FROM memories WHERE session_id != ? ORDER BY session_id",
+            (UNSCOPED_SESSION,),
+        ).fetchall()
+        return [str(r["session_id"]) for r in rows]
+
+    def recently_stored(self, session_id: str, summary: str, window_days: float = 7.0) -> bool:
+        return self._has_recent_duplicate(session_id, clip(summary, MAX_LINE_CHARS), window_days * 86400.0)
+
+    def missed_turns(self, session_id: str, since: float) -> list[dict[str, Any]]:
+        """Turns where recall ran and nothing was selected (the retrieval gap
+        Reflexion turns into a note). The first turns of an empty session do
+        not count: there was nothing to fail to remember."""
+        rows = self._db.execute(
+            "SELECT rt.turn_id, rt.query, rt.candidates, rt.created_at FROM retrieval_turns rt"
+            " WHERE rt.session_id = ? AND rt.selected = 0 AND rt.created_at >= ?"
+            " AND EXISTS (SELECT 1 FROM memories m WHERE m.session_id = rt.session_id"
+            "             AND m.created_at_real < rt.created_at)"
+            " ORDER BY rt.created_at",
+            (session_id, since),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def rows_of(self, session_id: str, *, memory_type: str | None = None, status: str | None = None,
+                event_kind: str | None = None, since: float | None = None) -> list[dict[str, Any]]:
+        rows = self._db.execute(
+            "SELECT * FROM memories WHERE session_id = ?"
+            " AND (? IS NULL OR memory_type = ?) AND (? IS NULL OR status = ?)"
+            " AND (? IS NULL OR event_kind = ?) AND (? IS NULL OR created_at_real >= ?)"
+            " ORDER BY created_at_real",
+            (session_id, memory_type, memory_type, status, status, event_kind, event_kind, since, since),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def session_sims(self, session_id: str) -> list[tuple[int, str, int]]:
+        """(entity_id, name, linked memory count) for sims in a session, busiest first."""
+        rows = self._db.execute(
+            "SELECT e.entity_id, e.name, COUNT(*) AS n FROM memory_entities me"
+            " JOIN memories m ON m.memory_id = me.memory_id"
+            " JOIN entities e ON e.entity_id = me.entity_id"
+            " WHERE m.session_id = ? AND e.kind = 'sim' AND m.status IN ('active','open')"
+            " GROUP BY e.entity_id ORDER BY n DESC, e.entity_id",
+            (session_id,),
+        ).fetchall()
+        return [(int(r["entity_id"]), str(r["name"]), int(r["n"])) for r in rows]
+
+    def pair_evidence(self, session_id: str, a: int, b: int, *, since: float | None = None,
+                      limit: int = 50) -> list[dict[str, Any]]:
+        """Recallable rows linked to both sims, most important and recent first.
+        Derived rows (summaries, reflections) are not evidence for themselves."""
+        rows = self._db.execute(
+            "SELECT m.* FROM memories m"
+            " WHERE m.session_id = ? AND m.status IN ('active','open')"
+            " AND m.memory_type != 'relationship_summary' AND COALESCE(m.event_kind, '') != 'reflection'"
+            " AND (? IS NULL OR m.created_at_real >= ?)"
+            " AND EXISTS (SELECT 1 FROM memory_entities x WHERE x.memory_id = m.memory_id AND x.entity_id = ?)"
+            " AND EXISTS (SELECT 1 FROM memory_entities y WHERE y.memory_id = m.memory_id AND y.entity_id = ?)"
+            " ORDER BY m.importance DESC, m.created_at_real DESC LIMIT ?",
+            (session_id, since, since, a, b, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def relationship_summary(self, session_id: str, a: int, b: int) -> dict[str, Any] | None:
+        """The active summary row for a sim pair, if one exists."""
+        row = self._db.execute(
+            "SELECT m.* FROM memories m"
+            " WHERE m.session_id = ? AND m.memory_type = 'relationship_summary' AND m.status = 'active'"
+            " AND EXISTS (SELECT 1 FROM memory_entities x WHERE x.memory_id = m.memory_id AND x.entity_id = ?)"
+            " AND EXISTS (SELECT 1 FROM memory_entities y WHERE y.memory_id = m.memory_id AND y.entity_id = ?)"
+            " ORDER BY m.created_at_real DESC LIMIT 1",
+            (session_id, a, b),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def archive(self, memory_id: int) -> None:
+        """Retire one row by hand or by a batch rule (still recoverable)."""
+        self._require(memory_id)
+        self._db.execute("UPDATE memories SET status = 'archived' WHERE memory_id = ?", (memory_id,))
+        self._db.commit()
+
+    def supersede(self, old_id: int, new_id: int) -> None:
+        """Retire ``old_id`` in favour of ``new_id`` (both must exist)."""
+        self._require(old_id)
+        self._require(new_id)
+        self._db.execute(
+            "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE memory_id = ?", (new_id, old_id),
+        )
+        self._db.commit()
 
     # ----------------------------------------------------------------- admin
 
@@ -803,7 +922,7 @@ class MemoryStore:
                  "summary": r["summary"], **json.loads(r["breakdown"])} for r in rows]
 
 
-def _reason(breakdown: dict[str, float]) -> str:
+def _reason(breakdown: dict[str, float], event_kind: str | None = None) -> str:
     parts: list[str] = []
     if breakdown["kw"] >= 0.5:
         parts.append("키워드 일치")
@@ -814,7 +933,7 @@ def _reason(breakdown: dict[str, float]) -> str:
     if breakdown["rec"] >= 0.7:
         parts.append("최근 사건")
     if breakdown["open"] >= 1.0:
-        parts.append("미완료 약속")
+        parts.append("되새길 교훈" if event_kind == "reflection" else "미완료 약속")
     if breakdown["pin"] > 0:
         parts.append("고정됨")
     return ", ".join(parts) or "약한 관련성"

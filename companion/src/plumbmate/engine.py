@@ -18,6 +18,7 @@ from .protocol import (
 )
 from .drives import describe as describe_drives
 from .memory import MemoryStore
+from .reflection import maintain
 from .providers import Provider
 from .turn_status import write_turn_status
 
@@ -33,7 +34,8 @@ class CompanionEngine:
     """
 
     def __init__(self, paths: BridgePaths, provider: Provider, *, max_attempts: int = 20,
-                 memory: MemoryStore | None = None, recall: bool = False) -> None:
+                 memory: MemoryStore | None = None, recall: bool = False,
+                 maintenance_every: int = 20) -> None:
         self.paths = paths
         self.provider = provider
         self.paths.ensure()
@@ -43,6 +45,13 @@ class CompanionEngine:
         self.recall_enabled = bool(recall and memory is not None)
         self.memory_errors = 0
         self.last_recall_lines = 0
+        # Between-turns cognition (merge, archive, summaries, reflection)
+        # runs after every N completed turns; 0 disables it. It is rule-based
+        # and touches only SQLite, so it costs no model attempt.
+        self.maintenance_every = max(0, int(maintenance_every))
+        self.completed_turns = 0
+        self.maintenance_runs = 0
+        self.last_maintenance: dict[str, int] | None = None
 
     def _memory_call(self, action, *args):
         """Memory must never decide a turn's fate; failures are counted."""
@@ -114,8 +123,14 @@ class CompanionEngine:
                 raise ProtocolError("Turn failed; retained in archive/rejected; no automatic retry") from exc
             shutil.move(str(request_path), str(self.paths.archive / request_path.name))
             write_turn_status(self.paths, request["request_id"], "completed")
+            self.completed_turns += 1
             if self.memory is not None:
                 self._memory_call(self.memory.remember_turn_response, request, response)
+                if self.maintenance_every and self.completed_turns % self.maintenance_every == 0:
+                    outcome = self._memory_call(maintain, self.memory, request.get("session_id"))
+                    if outcome is not None:
+                        self.maintenance_runs += 1
+                        self.last_maintenance = outcome
             return response_path
         return None
 
