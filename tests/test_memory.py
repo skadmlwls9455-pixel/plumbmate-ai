@@ -191,6 +191,15 @@ class StoreTests(StoreHarness):
             "SELECT recall_count FROM memories WHERE memory_id = ?", (recalled[0].memory_id,)).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_events_already_in_the_request_are_not_recalled_again(self):
+        events = ["둘이 같은 집으로 이사했다"]
+        self.store.remember_turn_request(request("안녕", events=events))
+        self.store.remember_turn_request(request("뒷마당에 불이 났어"))
+        recalled = self.store.recall(request("이사한 집 불난 거", events=events))
+        summaries = [r.summary for r in recalled]
+        self.assertNotIn("둘이 같은 집으로 이사했다", summaries)
+        self.assertTrue(any("뒷마당" in s for s in summaries))
+
     def test_config_is_a_single_tunable_row(self):
         self.store.set_config(w_kw=3.0)
         self.assertEqual(self.store.config()["w_kw"], 3.0)

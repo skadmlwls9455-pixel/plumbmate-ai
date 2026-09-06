@@ -397,6 +397,11 @@ class MemoryStore:
         tokens = tokenize(query_text)
         present = self._request_entities(request)
         scored = self._score_candidates(session_id, tokens, present)
+        # The adapter repeats recent_events on every turn; the rows they
+        # created would otherwise recall themselves and spend slots on text
+        # the model already sees in the request.
+        already_in_request = {clip(str(item), MAX_LINE_CHARS) for item in request.get("recent_events") or []}
+        scored = [item for item in scored if item.summary not in already_in_request]
         selected = self._select(scored)
         if log:
             self._log(str(request.get("request_id") or "unknown"), scored, selected)
