@@ -15,6 +15,7 @@ from .protocol import PROTOCOL_VERSION, ProtocolError, validate_response
 from .pricing import SpendingBlocked, SpendingPolicy
 from .spend_ledger import SpendLedger
 from .provider_http import post_openai
+from .dialogue import dialogue_context
 
 
 class Provider(Protocol):
@@ -26,13 +27,14 @@ class MockProvider:
     """Predictable offline provider for development and demos."""
 
     def respond(self, request: dict[str, Any]) -> dict[str, Any]:
-        actor_name = str(request.get("actor", {}).get("name", "에이든"))
+        context = dialogue_context(request)
+        actor_name = context["partner"]["name"]
         message = str(request.get("player_message", ""))
         budget = TokenBudget.for_request(request)
         response = {
             "protocol_version": PROTOCOL_VERSION,
             "request_id": request["request_id"],
-            "partner_message": f"{actor_name}: 좋아. ‘{message[:80]}’부터 같이 해보자.",
+            "partner_message": f"[연결 테스트·mock] {actor_name}: 좋아. ‘{message[:80]}’부터 같이 해보자.",
             "action": {
                 "name": "suggest_only",
                 "arguments": {
@@ -85,11 +87,11 @@ class OpenAIResponsesProvider:
             raise SpendingBlocked("Provider configuration differs from the billing policy")
         compact = clamp_request(request)
         # Transport IDs/timestamps are local bookkeeping, not roleplay context.
-        context = {key: compact[key] for key in ("actor", "player_message", "household", "recent_events")
-                   if key in compact}
+        context = dialogue_context(compact)
         budget = TokenBudget(estimate_tokens(context), self.max_output_tokens)
         instructions = (
-            "You are a warm Korean-speaking co-player controlling a fictional companion Sim. "
+            "Roleplay ONLY the explicitly designated partner, never the player Sim. "
+            "You are a warm Korean-speaking fictional companion. "
             "Reply briefly in Korean. Choose exactly one allow-listed action. Never invent a target "
             "identifier. Prefer suggest_only when required identifiers are absent. The game will ask "
             "the player before any action executes. Return only the requested JSON schema."

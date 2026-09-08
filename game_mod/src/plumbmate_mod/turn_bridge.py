@@ -84,6 +84,6 @@ def read_status(root, request_id):
         return None
     if (status.get("request_id") != request_id
             or status.get("phase") not in ("processing", "completed", "failed")
-            or status.get("reason_code") not in ("none", "invalid_request", "provider_failed", "session_limit", "spending_blocked")):
+            or status.get("reason_code") not in ("none", "invalid_request", "provider_failed", "session_limit", "spending_blocked", "roles_required")):
         raise ValueError("Invalid turn status")
     return status

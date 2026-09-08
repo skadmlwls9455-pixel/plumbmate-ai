@@ -40,8 +40,9 @@ def make_demo_request(message: str) -> dict[str, object]:
         "player_message": message,
         "session_id": "portfolio-demo",
         "game": {"name": "The Sims 4", "adapter": "prototype"},
-        "actor": {"sim_id": 2, "name": "에이든", "age": "YOUNGADULT", "mood": "HAPPY"},
-        "household": [{"sim_id": 1, "name": "플레이어 심"}, {"sim_id": 2, "name": "에이든"}],
+        "actor": {"sim_id": 2, "name": "플레이어 심", "age": "YOUNGADULT", "mood": "HAPPY"},
+        "household": [{"sim_id": 1, "name": "AI 파트너"}, {"sim_id": 2, "name": "플레이어 심"}],
+        "roles": {"binding_id": uuid.uuid4().hex, "scene_id": uuid.uuid4().hex, "player_sim_id": 2, "partner_sim_id": 1},
         "recent_events": ["둘이 같은 집으로 이사했다", "사진 촬영용 의상을 골랐다"],
         "memory_summary": "서로 다정한 연인이고 함께 보내는 조용한 시간을 좋아한다.",
     }

@@ -6,6 +6,7 @@ import time
 
 from plumbmate.budget import canonical_json, clamp_request
 from plumbmate.cli import make_demo_request
+from plumbmate.dialogue import dialogue_context
 
 
 def main():
@@ -15,7 +16,7 @@ def main():
         request["memory_summary"] = ""
         start = time.perf_counter()
         packed = clamp_request(request)
-        context = {key: packed[key] for key in ("actor", "player_message", "household", "recent_events") if key in packed}
+        context = dialogue_context(packed)
         before.append(len(canonical_json(packed).encode("utf-8")))
         after.append(len(canonical_json(context).encode("utf-8")))
         elapsed.append((time.perf_counter() - start) * 1000)

@@ -1,16 +1,19 @@
 # Architecture: implemented foundation vs target product
 
-Updated 2026-09-07 (local checkpoint). The master RFC map describes a target, not shipped behavior.
+Updated 2026-09-08 (local checkpoint). The master RFC map describes a target, not shipped behavior.
 
 ## Current responsibilities
 
 - `game_mod/commands.py`: EA snapshot queries, cheat registration/output, bridge startup configuration.
+- `game_mod/role_binding.py`: pure session-only player/partner binding, object/ID identity fences. No game APIs, persistence or transport.
+- `game_mod/role_setup_ui.py`: optional native two-step picker and notification adapter. No Sim creation or model calls; display remains live-unverified.
 - `game_mod/turn_bridge.py`: bounded file requests/responses and user-facing turn receipts. Runs only from explicit commands, never the tick pump.
 - `game_mod/tick_driver.py`: hook ownership, suspension, bounded pump scheduling.
 - `game_mod/bridge_client.py`: nonblocking, literal-loopback transport and authentication on the engine thread. No model calls or worker threads here.
 - `companion/contracts.py` + `schemas/`: canonical shape/type/length/allow-list contracts, compiled once at companion startup. Provider-generated fields derive from the response contract; identifiers remain locally owned.
 - `companion/protocol.py`: bounded JSON file exchange and request enumeration, re-exporting contracts for existing callers.
 - `companion/budget.py`: validated context packing and per-process attempt allowance; no billing claims.
+- `companion/dialogue.py`: validates explicit distinct player/partner roles against the snapshot before model execution; projects only relevant role context.
 - `companion/pricing.py`, `spend_ledger.py`, `billing_cli.py`: explicit USD rate/limit policy, external-only durable reservations and audited operator reconciliation. No keys or RP text in the ledger.
 - `companion/provider_http.py`: bounded official-endpoint HTTPS, no redirects, retries, or remote error-body echo.
 - `companion/doctor.py`: non-destructive local configuration and optional authenticated-loopback diagnostics; no model request.
@@ -28,12 +31,13 @@ Updated 2026-09-07 (local checkpoint). The master RFC map describes a target, no
 5. Unknown save scope means no persistent RP memory restoration. Model-generated patches are not promoted to observed facts. Existing session files are preserved but ignored.
 6. API uncertainty does not trigger automatic retries during normal single-engine processing. Connection retries are independent from paid model retries.
 7. Sequential server lifecycle control: stop admissions before sweeping connections. Retain timed-out worker references and refuse restart while old workers survive.
+8. The selected Sim is not the AI identity. Require a matching role binding; reject missing/ambiguous roles before provider/attempt use. Role/zone replacement invalidates display of previous requests. These in-memory fences are NOT verified save lineage.
 
 ## Resource and privacy limits
 
 Request/response files and socket frames are capped at 64 KiB. Context JSON is
 capped at 12,000 UTF-8 bytes; optional items are removed without altering the
-current message or actor. Per-field limits come from one schema, not parallel
+current message or either role identity. Per-field limits come from one schema, not parallel
 hand-written validators. Public schema copies are generated and checked by CI.
 
 All CLI engine modes default to 20 model attempts per process, including failed
@@ -52,7 +56,7 @@ play text; retention, export, deletion UI, and disk quotas remain release work.
 
 ## Not implemented yet
 
-The autonomous NPC-like partner, selected partner binding, observed event
+The autonomous NPC-like partner, durable partner/profile settings, observed event
 atomization, verified save/branch receipts, memory DB/retrieval, L0–L3 router,
 IC scheduler, and relationship features remain separate milestones. Pure
 save-lineage and state-delta helpers exist but are not proof of end-to-end use.
@@ -67,14 +71,17 @@ CI is configured for the installed companion on macOS/Ubuntu, Python 3.11/3.13,
 plus game-source 3.7 syntax and schema export guards. Positive stub tests cover
 multiword Korean chat through files, mock response, and game display. Local
 game-runtime builds check bytecode compatibility separately; neither CI nor a
-build proves gameplay.
+build proves gameplay. Role picker tests use stricter constructor stubs derived
+from installed bytecode, not the actual game UI.
 
 The 2026-09-07 installed alpha passed a Korean multiword mock round trip and
 idle keepalive/ACK checks in the game. The last two defensive source changes
 still need a new build/install; see the exact artifact hash and limitations in
-[the checkpoint](CHECKPOINT_2026-09-07_KO.md).
+[the checkpoint](CHECKPOINT_2026-09-07_KO.md). The newer alpha.3 role and
+notification adapter build is not installed/live-tested yet; see
+[the role checkpoint](CHECKPOINT_2026-09-08_ROLES_KO.md).
 
-Before a release: explicit player/partner roles, response/save-scope isolation,
+Before a release: live-verified role UX, response/save-scope isolation,
 general durable request claiming (paid IDs are protected by the spending ledger),
 real-provider billing validation, disk retention, and an ordinary-player UI.
 Do not mask transport failures as invented character behavior.

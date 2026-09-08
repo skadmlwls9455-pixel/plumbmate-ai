@@ -20,6 +20,16 @@
     "created_at": {"type": "string", "minLength": 1, "maxLength": 40},
     "player_message": {"type": "string", "maxLength": 1000},
     "session_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "roles": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binding_id", "scene_id", "player_sim_id", "partner_sim_id"],
+      "properties": {
+        "binding_id": {"type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32},
+        "scene_id": {"type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32},
+        "player_sim_id": {"$ref": "#/$defs/sim_id"},
+        "partner_sim_id": {"$ref": "#/$defs/sim_id"}
+      }
+    },
     "game": {
       "type": "object",
       "additionalProperties": false,

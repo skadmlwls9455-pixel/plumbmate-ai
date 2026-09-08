@@ -3,8 +3,8 @@
 **An AI companion that plays a life simulation beside you, not over you.**
 
 PlumbMate is an experimental, local-first bridge between The Sims 4 and an AI
-companion. The companion receives a deliberately small snapshot of the active
-Sim, chats with the player, and returns a structured, allow-listed gameplay
+companion. The companion receives a deliberately small snapshot of the explicitly
+chosen player and partner Sims, chats with the player, and returns a structured, allow-listed gameplay
 suggestion. The long-term goal is a “second player” experience: the AI explains
 what it wants to do, the player can approve it, and only then is the action
 queued for the companion Sim.
@@ -25,13 +25,24 @@ actions yet.
 
 ## MVP flow
 
-1. The game-side script writes a compact JSON request when the player runs
+1. In this alpha, use `plumbmate.setup` to choose the player Sim and AI partner
+   separately from the same household. At least two Sims are needed; the mod
+   never creates one. Roles reset across zone/household replacement and restart.
+2. The game-side script writes a compact JSON request when the player runs
    `plumbmate.chat <message>` in the cheat console.
-2. The local companion reads the request and asks a configured provider for a
+3. The local companion validates both roles before reserving an attempt, then asks a configured provider for a
    short Korean reply plus one structured action suggestion.
-3. The response is written back to the local bridge directory.
-4. `plumbmate.read` displays the response matching the last submitted request,
-   or its processing/failure/session-limit status. It never reads another turn's newest file.
+4. The response is written back to the local bridge directory.
+5. `plumbmate.read` attempts to show that request's reply on the notification wall
+   (console fallback). Pending/failed status stays in the console. Repeated reads,
+   responses from a previous role binding and replies older than 180 real seconds
+   are not displayed. It never reads another turn's newest file.
+
+The native picker and notification adapters are **not yet live-verified** in this
+alpha. Matching alpha.3 game and companion code is required; older companions
+reject the added role fields. There is still no ordinary chat input window or
+automatic response delivery. The mock provider explicitly labels connection-test
+replies; they are not autonomous AI play. See the [role checkpoint](docs/CHECKPOINT_2026-09-08_ROLES_KO.md).
 
 The current game-side adapter reports only a safe, small identity/household
 snapshot. Action execution is intentionally disabled in this first milestone.
@@ -110,7 +121,7 @@ Canonical contracts live in `companion/src/plumbmate/schemas/`. Run
 monetary limit; restarting starts a new allowance. Failed and over-limit turns
 are retained under `archive/rejected`, not automatically resubmitted.
 The context JSON is capped at **12,000 UTF-8 bytes**, preserving the live message
-and actor. Optional context is reduced as whole items. Console token totals are
+and both role identities. Optional context is reduced as whole items. Console token totals are
 heuristic context estimates, not provider usage or billed tokens.
 Event payload logging is opt-in via `--verbose-events`.
 
@@ -145,8 +156,9 @@ The model is intentionally not hard-coded. This avoids silently switching cost
 or behavior when model availability changes. Requests use `store: false`.
 Persistent RP memory restoration is currently **disabled** until save-scope
 receipts are connected; model-generated memory patches are not stored as facts.
-Retrieval, model routing, partner-role selection and ordinary-player UI remain
-future work. Usage accounting and daily/cumulative/per-request USD limits are
+Retrieval, model routing, persistent role/profile settings and ordinary-player
+chat UI remain future work. The current role picker is a session-only prototype.
+Usage accounting and daily/cumulative/per-request USD limits are
 implemented locally but have not been tested with a billable provider call.
 See [current architecture](docs/ARCHITECTURE.md)
 and [UX/context review](docs/UX_CONTEXT_REVIEW_2026-09-06_KO.md).
@@ -158,7 +170,8 @@ python -m plumbmate.cli doctor --bridge .plumbmate --connect
 ```
 
 The full implementation/verification gaps and next UX work are tracked in the
-[2026-09-07 checkpoint](docs/CHECKPOINT_2026-09-07_KO.md).
+[2026-09-07 checkpoint](docs/CHECKPOINT_2026-09-07_KO.md), followed by the
+[2026-09-08 role checkpoint](docs/CHECKPOINT_2026-09-08_ROLES_KO.md).
 
 ## Build the game-side archive
 

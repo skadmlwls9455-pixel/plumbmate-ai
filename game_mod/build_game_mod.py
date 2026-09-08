@@ -61,6 +61,8 @@ def build(output: Path, game_app: Path = DEFAULT_GAME_APP, *, diagnostic: bool =
             (source_root / "plumbmate_mod" / "bridge_client.py", Path("plumbmate_bridge_client.pyc")),
             (source_root / "plumbmate_mod" / "tick_driver.py", Path("plumbmate_tick_driver.pyc")),
             (source_root / "plumbmate_mod" / "turn_bridge.py", Path("plumbmate_turn_bridge.pyc")),
+            (source_root / "plumbmate_mod" / "role_binding.py", Path("plumbmate_role_binding.pyc")),
+            (source_root / "plumbmate_mod" / "role_setup_ui.py", Path("plumbmate_role_setup_ui.pyc")),
         ])
 
     library, base_zip, core_zip = _game_paths(game_app)

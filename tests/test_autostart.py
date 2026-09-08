@@ -110,6 +110,8 @@ class AutostartTests(unittest.TestCase):
         _load_root_module("plumbmate_bridge_client", "bridge_client.py")
         _load_root_module("plumbmate_tick_driver", "tick_driver.py")
         _load_root_module("plumbmate_turn_bridge", "turn_bridge.py")
+        _load_root_module("plumbmate_role_binding", "role_binding.py")
+        _load_root_module("plumbmate_role_setup_ui", "role_setup_ui.py")
         spec = importlib.util.spec_from_file_location(
             "plumbmate_boot_under_test", self.boot_source
         )
@@ -426,7 +428,13 @@ class AutostartTests(unittest.TestCase):
 
         module = self.boot()
         info = types.SimpleNamespace(sim_id=42, full_name="Test Partner", age="ADULT", gender="X")
-        sim = types.SimpleNamespace(sim_info=info)
+        partner = types.SimpleNamespace(sim_id=43, full_name="Other Sim", get_sim_instance=lambda: object())
+        members = [info, partner]
+        household = types.SimpleNamespace(sim_info_gen=lambda: iter(members))
+        sim = types.SimpleNamespace(sim_info=info, household=household)
+        zone_obj = object()
+        module.services.current_zone = lambda: zone_obj
+        module.ROLE_BINDING.bind(zone_obj, household, info, partner, members)
         manager = types.SimpleNamespace(get=lambda connection: types.SimpleNamespace(active_sim=sim))
         lines = []
         with mock.patch.object(module.services, "client_manager", return_value=manager), \
@@ -439,6 +447,85 @@ class AutostartTests(unittest.TestCase):
             self.assertIsNotNone(CompanionEngine(paths, MockProvider()).process_one())
             module.plumbmate_read(_connection=7)
         self.assertTrue(any("오늘 같이 산책할까?" in line for line in lines))
+
+    def _ready_role_pair(self, module):
+        player = types.SimpleNamespace(sim_id=10, full_name="Player")
+        partner = types.SimpleNamespace(sim_id=11, full_name="Partner")
+        members = [player, partner]
+        household = types.SimpleNamespace(sim_info_gen=lambda: iter(members))
+        player_sim = types.SimpleNamespace(sim_info=player, household=household)
+        partner_sim = types.SimpleNamespace(sim_info=partner, household=household)
+        player.get_sim_instance = lambda: player_sim
+        partner.get_sim_instance = lambda: partner_sim
+        current = {"selected": player_sim, "zone": object()}
+        module.services.client_manager = lambda: types.SimpleNamespace(
+            get=lambda _: types.SimpleNamespace(active_sim=current["selected"]))
+        module.services.current_zone = lambda: current["zone"]
+        module.ROLE_BINDING.bind(current["zone"], household, player, partner, members)
+        return current, player_sim, partner_sim
+
+    def test_changing_selected_sim_does_not_swap_player_and_ai(self):
+        from plumbmate.protocol import read_json
+        module = self.boot()
+        current, player, partner = self._ready_role_pair(module)
+        current["selected"] = partner
+        module.plumbmate_chat("hello", "partner", _connection=7)
+        path, = (self.mods_root / "PlumbMateBridge/requests").glob("*.json")
+        request = read_json(path)
+        self.assertEqual(request["actor"]["sim_id"], player.sim_info.sim_id)
+        self.assertEqual(request["roles"]["partner_sim_id"], partner.sim_info.sim_id)
+
+    def test_chat_double_submit_creates_only_one_request(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        module.plumbmate_chat("again", _connection=7)
+        self.assertEqual(len(list((self.mods_root / "PlumbMateBridge/requests").glob("*.json"))), 1)
+
+    def test_notification_is_shown_once_for_exact_turn(self):
+        from plumbmate.engine import CompanionEngine
+        from plumbmate.protocol import BridgePaths
+        from plumbmate.providers import MockProvider
+        module = self.boot()
+        self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        CompanionEngine(BridgePaths(self.mods_root / "PlumbMateBridge"), MockProvider()).process_one()
+        with mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
+            module.plumbmate_read(_connection=7)
+            module.plumbmate_read(_connection=7)
+            notify.assert_called_once()
+
+    def test_old_zone_reply_is_not_even_read_from_disk(self):
+        module = self.boot()
+        current, _, _ = self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        current["zone"] = object()
+        with mock.patch.object(module, "_latest_response") as read:
+            module.plumbmate_read(_connection=7)
+            read.assert_not_called()
+
+    def test_reply_after_reassignment_or_ttl_is_not_displayed(self):
+        for case in ("reassignment", "ttl"):
+            module = self.boot()
+            self._ready_role_pair(module)
+            module.plumbmate_chat("hello", _connection=7)
+            if case == "reassignment":
+                self._ready_role_pair(module)
+            else:
+                module._LAST_SENT_AT -= module.TURN_DISPLAY_TTL_SECONDS
+            with self.subTest(case=case), mock.patch.object(module, "_latest_response") as read:
+                module.plumbmate_read(_connection=7)
+                read.assert_not_called()
+
+    def test_partner_off_lot_blocks_request_without_clearing_roles(self):
+        module = self.boot()
+        _, _, partner = self._ready_role_pair(module)
+        partner.sim_info.get_sim_instance = lambda: None
+        binding_id = module.ROLE_BINDING.binding_id
+        with mock.patch.object(module, "_write_request") as write:
+            module.plumbmate_chat("hello", _connection=7)
+            write.assert_not_called()
+        self.assertEqual(module.ROLE_BINDING.binding_id, binding_id)
 
     def test_chat_without_client_manager_is_a_normal_refusal(self):
         module = self.boot()

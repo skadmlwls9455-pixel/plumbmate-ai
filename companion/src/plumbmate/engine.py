@@ -19,6 +19,7 @@ from .protocol import (
 from .providers import Provider
 from .turn_status import write_turn_status
 from .pricing import SpendingBlocked
+from .dialogue import RoleSetupRequired, dialogue_context
 
 
 class CompanionEngine:
@@ -49,8 +50,10 @@ class CompanionEngine:
                 request["memory_summary"] = ""
                 request["state_delta"] = {}
                 request = clamp_request(request)
-            except ProtocolError:
-                write_turn_status(self.paths, request_path.stem, "failed", "invalid_request")
+                dialogue_context(request)
+            except ProtocolError as exc:
+                reason = "roles_required" if isinstance(exc, RoleSetupRequired) else "invalid_request"
+                write_turn_status(self.paths, request_path.stem, "failed", reason)
                 self._quarantine(request_path)
                 continue
             response_path = self.paths.responses / f"{request['request_id']}.json"

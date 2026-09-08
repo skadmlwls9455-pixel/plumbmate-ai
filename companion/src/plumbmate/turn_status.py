@@ -3,7 +3,7 @@
 from .protocol import BridgePaths, ProtocolError, atomic_write_json, validate_request_id
 
 PHASES = frozenset(("processing", "completed", "failed"))
-REASONS = frozenset(("none", "invalid_request", "provider_failed", "session_limit", "spending_blocked"))
+REASONS = frozenset(("none", "invalid_request", "provider_failed", "session_limit", "spending_blocked", "roles_required"))
 
 
 def write_turn_status(paths: BridgePaths, request_id: str, phase: str, reason: str = "none") -> bool:
