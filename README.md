@@ -126,13 +126,39 @@ python -m plumbmate.cli serve \
   --bridge .plumbmate --provider openai
 ```
 
+Paid calls also require a reviewed billing policy. Without one, they fail closed
+before any HTTP request. Run `python -m plumbmate.cli budget configure --help`
+for explicit USD caps, exact model ID, price expiry and per-million input,
+cached-input, cache-write and output rates. The default caps are zero.
+Policy path defaults to `~/.config/plumbmate/billing.json`; override with
+`PLUMBMATE_BILLING_CONFIG`. Its sibling SQLite ledger is shared across bridge
+folders and must not be deleted to work around a spending block.
+
+`budget status` displays recorded/reserved amounts and unresolved request IDs.
+Uncertain calls block further spending across restarts. `budget reconcile` is an
+explicit, audited operator action after stopping active calls and checking the
+provider charge, not an automatic refund. These are developer CLI controls, not
+the finished novice-friendly setup UI. The rate-card figures exclude taxes,
+exchange rates, other apps, and unexpected provider pricing changes.
+
 The model is intentionally not hard-coded. This avoids silently switching cost
 or behavior when model availability changes. Requests use `store: false`.
 Persistent RP memory restoration is currently **disabled** until save-scope
 receipts are connected; model-generated memory patches are not stored as facts.
-Retrieval, model routing, actual usage accounting, and daily currency limits are
-future work, not completed features. See [current architecture](docs/ARCHITECTURE.md)
+Retrieval, model routing, partner-role selection and ordinary-player UI remain
+future work. Usage accounting and daily/cumulative/per-request USD limits are
+implemented locally but have not been tested with a billable provider call.
+See [current architecture](docs/ARCHITECTURE.md)
 and [UX/context review](docs/UX_CONTEXT_REVIEW_2026-09-06_KO.md).
+
+For a non-destructive connection check (no model call):
+
+```bash
+python -m plumbmate.cli doctor --bridge .plumbmate --connect
+```
+
+The full implementation/verification gaps and next UX work are tracked in the
+[2026-09-07 checkpoint](docs/CHECKPOINT_2026-09-07_KO.md).
 
 ## Build the game-side archive
 
@@ -163,6 +189,9 @@ local/mock mode, publish the exact transmitted schema, and never bundle keys.
 - [x] Deterministic state delta and token budget estimator
 - [x] Python 3.7-compatible game command prototype
 - [x] In-game script discovery and import smoke test
+- [x] Korean multiword mock chat/read round trip in the authorized current household (no save command)
+- [x] Local durable spending reservations and USD limits (synthetic billing tests)
+- [x] Non-destructive connection diagnosis CLI
 - [ ] Throwaway-household command round trip
 - [ ] Player approval UI
 - [ ] Allow-listed action execution

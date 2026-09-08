@@ -51,6 +51,19 @@ def closed_port():
 
 
 class ConstructionTests(unittest.TestCase):
+    def test_connection_intervals_reject_invalid_numbers(self):
+        for value in (0, -1, True, float("nan"), float("inf"), 3601):
+            for key in ("ack_timeout", "keepalive"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    bridge.BridgeClient(TOKEN, 1, **{key: value})
+
+    def test_duplicate_queued_identifier_cannot_lose_ack_deadline(self):
+        client = bridge.BridgeClient(TOKEN, 1)
+        client.queue_event("heartbeat", {}, event_id="same")
+        with self.assertRaises(ValueError):
+            client.queue_event("heartbeat", {}, event_id="same")
+        self.assertEqual(client.queued, 1)
+
     def test_invalid_port_is_refused_before_connect(self):
         for port in (-1, 0, 65536):
             with self.subTest(port=port), self.assertRaises(ValueError):
@@ -116,6 +129,50 @@ class BufferedFrameTests(unittest.TestCase):
 
     def ack(self, event_id):
         return json.dumps({"kind": "ack", "event_id": event_id}).encode() + b"\n"
+
+    def test_ack_timeout_is_bounded_and_never_resends_unknown_outcome(self):
+        clock = Clock()
+        client = self.client([])
+        client._now = clock
+        client._next_keepalive = clock() + 60
+        client.queue_event("heartbeat", {})
+        client.pump()
+        self.assertEqual(client.awaiting_ack, 1)
+        clock.advance(16)
+        client.pump()
+        self.assertEqual(client.last_error, "ack_timeout")
+        self.assertEqual(client.state, bridge.BACKOFF)
+        self.assertEqual(client.queued, 0)
+        self.assertEqual(client.stats["lost_events"], 1)
+        self.assertEqual(client._pending_since, {})
+
+    def test_idle_keepalive_is_single_bounded_event_not_per_tick(self):
+        clock = Clock()
+        client = self.client([])
+        client._now = clock
+        client._next_keepalive = clock() + 60
+        for _ in range(100):
+            client.pump()
+        self.assertEqual(client.stats["sent_events"], 0)
+        clock.advance(61)
+        client.pump()
+        for _ in range(100):
+            client.pump()
+        self.assertEqual(client.stats["sent_events"], 1)
+        self.assertEqual(client.awaiting_ack, 1)
+
+    def test_ack_at_deadline_is_read_before_timeout(self):
+        clock = Clock()
+        client = self.client([])
+        client._now = clock
+        client._next_keepalive = clock() + 60
+        event_id = client.queue_event("heartbeat", {})
+        client.pump()
+        clock.advance(15)
+        client._socket.chunks.append(self.ack(event_id))
+        client.pump()
+        self.assertEqual(client.state, bridge.READY)
+        self.assertEqual(client._pending_since, {})
 
     def test_batch_larger_than_budget_drains_without_another_recv(self):
         ids = [str(i) for i in range(bridge.MAX_PENDING_ACKS)]

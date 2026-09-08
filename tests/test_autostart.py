@@ -447,6 +447,16 @@ class AutostartTests(unittest.TestCase):
             module.plumbmate_chat("hello", "there", _connection=7)
         self.assertTrue(any("active Sim not found" in line for line in lines))
 
+    def test_overlong_chat_is_refused_without_silent_truncation(self):
+        module = self.boot()
+        lines = []
+        with mock.patch.object(module, "_active_sim", return_value=object()), \
+                mock.patch.object(module, "_write_request") as write, \
+                mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            module.plumbmate_chat("가" * 1001, _connection=7)
+        write.assert_not_called()
+        self.assertTrue(any("1000" in line for line in lines))
+
     def test_unicode_path_does_not_shift_archive_boundary(self):
         module = self.boot()
         with mock.patch.object(module, "__file__", "/Users/İ/Mods/PlumbMate.TS4SCRIPT/plumbmate_boot.pyc"):

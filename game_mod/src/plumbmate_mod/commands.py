@@ -47,7 +47,7 @@ except Exception as _exc:
 
 
 PROTOCOL_VERSION = "0.1"
-MOD_VERSION = "0.1.1-alpha.1"
+MOD_VERSION = "0.1.1-alpha.2"
 DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
 
@@ -397,9 +397,12 @@ def plumbmate_chat(*message_parts, _connection=None):
     if sim is None:
         output("PlumbMate: active Sim not found. Load a household first.")
         return
-    message = " ".join(_safe_text(part) for part in message_parts).strip()[:1000]
+    message = " ".join(_safe_text(part) for part in message_parts).strip()
     if not message:
         output("PlumbMate: enter a message after plumbmate.chat.")
+        return
+    if len(message) > 1000:
+        output("PlumbMate: 메시지는 1000자까지 보낼 수 있어요. 내용을 줄여 주세요. 아직 전송하지 않았어요.")
         return
     try:
         target = _write_request(sim, message)
@@ -422,6 +425,7 @@ def plumbmate_read(_connection=None):
                     "invalid_request": "요청 형식이 맞지 않아 처리하지 못했어요.",
                     "provider_failed": "모델 응답에 실패했어요. 중복 호출 방지를 위해 자동 재시도하지 않아요.",
                     "session_limit": "이번 세션의 호출 한도에 도달했어요. 동반 앱에서 한도를 확인해 주세요.",
+                    "spending_blocked": "금액 한도 또는 미확정 과금 때문에 호출을 멈췄어요. 동반 앱의 budget status를 확인해 주세요.",
                 }
                 output("PlumbMate: " + messages.get(status["reason_code"], "응답을 처리하지 못했어요."))
             else:

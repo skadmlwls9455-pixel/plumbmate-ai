@@ -1,6 +1,6 @@
 # Architecture: implemented foundation vs target product
 
-Updated 2026-09-06. The master RFC map describes a target, not shipped behavior.
+Updated 2026-09-07 (local checkpoint). The master RFC map describes a target, not shipped behavior.
 
 ## Current responsibilities
 
@@ -11,6 +11,9 @@ Updated 2026-09-06. The master RFC map describes a target, not shipped behavior.
 - `companion/contracts.py` + `schemas/`: canonical shape/type/length/allow-list contracts, compiled once at companion startup. Provider-generated fields derive from the response contract; identifiers remain locally owned.
 - `companion/protocol.py`: bounded JSON file exchange and request enumeration, re-exporting contracts for existing callers.
 - `companion/budget.py`: validated context packing and per-process attempt allowance; no billing claims.
+- `companion/pricing.py`, `spend_ledger.py`, `billing_cli.py`: explicit USD rate/limit policy, external-only durable reservations and audited operator reconciliation. No keys or RP text in the ledger.
+- `companion/provider_http.py`: bounded official-endpoint HTTPS, no redirects, retries, or remote error-body echo.
+- `companion/doctor.py`: non-destructive local configuration and optional authenticated-loopback diagnostics; no model request.
 - `companion/engine.py`: request validation, context policy, duplicate response check, attempt reservation, provider invocation, final validation, quarantine, status.
 - `companion/turn_status.py`: best-effort non-narrative processing/failure receipts, not a transactional action/save ledger.
 - `companion/event_socket.py`: loopback listener and pure-Python companion workers. Settings/framing/server can be separated later; no game APIs are called by workers.
@@ -36,7 +39,12 @@ hand-written validators. Public schema copies are generated and checked by CI.
 All CLI engine modes default to 20 model attempts per process, including failed
 attempts. The context token estimate is a coarse UTF-8 heuristic and excludes
 API envelope/system/schema overhead; it is not provider usage or a money limit.
-Daily persisted spend limits and usage reconciliation are not implemented.
+OpenAI calls additionally require an explicit, unexpired price/limit policy and
+a shared persistent ledger. Reserve before HTTP; count the full request input;
+record provider usage before parsing the answer. Missing/uncertain billing data
+retains the reservation and blocks further paid calls, including after restart.
+Daily limits use UTC. This is local rate-card accounting, not an account-wide
+invoice guarantee. Mock mode remains free of provider calls.
 
 Event payload logging is opt-in. Turn receipts contain only request IDs and
 fixed status/reason codes. Local request/response archives still contain private
@@ -61,7 +69,12 @@ multiword Korean chat through files, mock response, and game display. Local
 game-runtime builds check bytecode compatibility separately; neither CI nor a
 build proves gameplay.
 
-Before a release: in-game smoke, response/save-scope isolation, request claiming
-against multiple consumers or process crashes, actual usage accounting, disk
-retention, and an ordinary-player UI. See the Korean UX/context review for the
-priority order. Do not mask transport failures as invented character behavior.
+The 2026-09-07 installed alpha passed a Korean multiword mock round trip and
+idle keepalive/ACK checks in the game. The last two defensive source changes
+still need a new build/install; see the exact artifact hash and limitations in
+[the checkpoint](CHECKPOINT_2026-09-07_KO.md).
+
+Before a release: explicit player/partner roles, response/save-scope isolation,
+general durable request claiming (paid IDs are protected by the spending ledger),
+real-provider billing validation, disk retention, and an ordinary-player UI.
+Do not mask transport failures as invented character behavior.

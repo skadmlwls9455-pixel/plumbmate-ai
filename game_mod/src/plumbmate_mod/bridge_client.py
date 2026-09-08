@@ -52,6 +52,8 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 30.0
+ACK_TIMEOUT_SECONDS = 15.0
+KEEPALIVE_SECONDS = 60.0
 
 # Must stay identical to the companion's transport allow list. It bounds what
 # the socket carries and says nothing about whether an event may be acted on.
@@ -142,6 +144,8 @@ class BridgeClient(object):
         max_backoff=MAX_BACKOFF_SECONDS,
         max_outbox=MAX_OUTBOX_EVENTS,
         max_frame_bytes=MAX_FRAME_BYTES,
+        ack_timeout=ACK_TIMEOUT_SECONDS,
+        keepalive=KEEPALIVE_SECONDS,
     ):
         if not isinstance(token, str) or len(token.strip()) < MIN_TOKEN_CHARACTERS:
             raise ValueError(
@@ -161,6 +165,12 @@ class BridgeClient(object):
         self._max_backoff = max_backoff
         self._max_outbox = max_outbox
         self._max_frame_bytes = max_frame_bytes
+        for interval in (ack_timeout, keepalive):
+            if type(interval) not in (int, float) or not 0 < interval <= 3600:
+                raise ValueError("Connection deadlines must be finite positive seconds, at most 3600")
+        self._ack_timeout = ack_timeout
+        self._keepalive = keepalive
+        self._next_keepalive = self._now() + keepalive
 
         self.state = DISCONNECTED
         self.last_error = None
@@ -178,6 +188,7 @@ class BridgeClient(object):
         self._outbound = bytearray()
         self._outbox = []
         self._pending = []
+        self._pending_since = {}
 
     @property
     def connected(self):
@@ -204,6 +215,9 @@ class BridgeClient(object):
         instead of being cut off mid-frame by the server.
         """
         frame = build_event(kind, payload, event_id)
+        if (frame["event_id"] in self._pending
+                or any(item[0] == frame["event_id"] for item in self._outbox)):
+            raise ValueError("Duplicate queued event identifier")
         encoded = json.dumps(frame, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(encoded) + 1 > self._max_frame_bytes:
             raise ValueError("Event frame exceeds the maximum size")
@@ -227,6 +241,7 @@ class BridgeClient(object):
         """Release the socket. Queued events are kept; in-flight ones are lost."""
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
+        self._pending_since.clear()
         self._close_socket()
         self._inbound = bytearray()
         self._outbound = bytearray()
@@ -261,6 +276,11 @@ class BridgeClient(object):
             return
         self._read_frames()
         if self.state == READY:
+            if any(now - sent_at >= self._ack_timeout for sent_at in self._pending_since.values()):
+                self._fail("ack_timeout")
+                return
+            if not self._pending and not self._outbox and now >= self._next_keepalive:
+                self.queue_event("heartbeat", {"source": "transport_keepalive"})
             self._encode_outbox()
         if self._socket is not None:
             self._flush_outbound()
@@ -361,6 +381,7 @@ class BridgeClient(object):
             self._backoff = 0.0
             self.last_error = None
             self.stats["handshakes"] += 1
+            self._next_keepalive = self._now() + self._keepalive
         elif self.state == READY:
             if kind == "ack":
                 self._resolve(frame.get("event_id"), True, None)
@@ -374,6 +395,7 @@ class BridgeClient(object):
             self.stats["unknown_frames"] += 1
             return
         self._pending.remove(event_id)
+        self._pending_since.pop(event_id, None)
         if accepted:
             self.stats["acked_events"] += 1
         else:
@@ -388,6 +410,8 @@ class BridgeClient(object):
             event_id, encoded = self._outbox.pop(0)
             self._outbound.extend(encoded)
             self._pending.append(event_id)
+            self._pending_since[event_id] = self._now()
+            self._next_keepalive = self._now() + self._keepalive
             self.stats["sent_events"] += 1
 
     def _write_frame(self, value):
@@ -414,6 +438,7 @@ class BridgeClient(object):
         # In-flight events have an unknown outcome and are never resent.
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
+        self._pending_since.clear()
         self.last_error = reason
         self._close_socket()
         self._inbound = bytearray()

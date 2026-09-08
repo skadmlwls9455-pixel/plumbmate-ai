@@ -18,6 +18,7 @@ from .protocol import (
 )
 from .providers import Provider
 from .turn_status import write_turn_status
+from .pricing import SpendingBlocked
 
 
 class CompanionEngine:
@@ -69,8 +70,11 @@ class CompanionEngine:
                 atomic_write_json(response_path, response)
             except Exception as exc:
                 # Timeouts may already incur charges: retain, never auto-retry.
-                write_turn_status(self.paths, request["request_id"], "failed", "provider_failed")
+                reason = "spending_blocked" if isinstance(exc, SpendingBlocked) else "provider_failed"
+                write_turn_status(self.paths, request["request_id"], "failed", reason)
                 self._quarantine(request_path)
+                if isinstance(exc, SpendingBlocked):
+                    raise SpendingBlocked(str(exc)) from None
                 raise ProtocolError("Turn failed; retained in archive/rejected; no automatic retry") from exc
             shutil.move(str(request_path), str(self.paths.archive / request_path.name))
             write_turn_status(self.paths, request["request_id"], "completed")
