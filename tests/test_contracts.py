@@ -62,16 +62,28 @@ class ContractTests(unittest.TestCase):
                     if isinstance(node, ast.ImportFrom):
                         self.assertNotIn((node.module or "").split(".")[0], {"plumbmate", "jsonschema"})
 
-    def test_build_manifest_covers_root_level_production_imports(self):
+    def test_build_manifest_covers_root_level_game_imports(self):
         build = ast.parse((ROOT / "game_mod/build_game_mod.py").read_text())
         manifest = {node.value for node in ast.walk(build)
                     if isinstance(node, ast.Constant) and isinstance(node.value, str)
                     and node.value.endswith(".pyc")}
-        source = ast.parse((ROOT / "game_mod/src/plumbmate_mod/commands.py").read_text())
-        imports = {alias.name + ".pyc" for node in ast.walk(source) if isinstance(node, ast.Import)
-                   for alias in node.names if alias.name.startswith("plumbmate_")}
+        imports = set()
+        # Includes transitive dependencies, not just the boot module's imports.
+        for path in (ROOT / "game_mod/src").rglob("*.py"):
+            source = ast.parse(path.read_text())
+            for node in ast.walk(source):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name + ".pyc" for alias in node.names if alias.name.startswith("plumbmate_"))
+                elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("plumbmate_"):
+                    imports.add(node.module + ".pyc")
         self.assertTrue(imports)
         self.assertTrue(imports <= manifest, imports - manifest)
+
+    def test_composer_message_limit_matches_canonical_request_contract(self):
+        source = ast.parse((ROOT / "game_mod/src/plumbmate_mod/chat_input.py").read_text())
+        limit, = [node.value.value for node in source.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "MAX_MESSAGE_CHARS" for target in node.targets)]
+        self.assertEqual(limit, REQUEST_SCHEMA["properties"]["player_message"]["maxLength"])
 
     def test_diagnostic_path_helpers_preserve_unicode_indices(self):
         for filename, helper in (("diagnostics.py", "_diagnostic_directory"), ("ownership_probe.py", "_root")):

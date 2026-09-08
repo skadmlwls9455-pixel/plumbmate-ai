@@ -26,6 +26,14 @@ try:
 except Exception:
     plumbmate_role_binding = None
     plumbmate_role_setup_ui = None
+try:
+    import plumbmate_chat_input
+except Exception:
+    plumbmate_chat_input = None
+try:
+    import plumbmate_chat_ui
+except Exception:
+    plumbmate_chat_ui = None
 
 # The build publishes these as root-level modules, like the diagnostic probe.
 # A partial or stale install must degrade to the filesystem bridge, not break
@@ -53,7 +61,7 @@ except Exception as _exc:
 
 
 PROTOCOL_VERSION = "0.1"
-MOD_VERSION = "0.1.1-alpha.3"
+MOD_VERSION = "0.1.1-alpha.4"
 DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
 
@@ -72,6 +80,7 @@ _LAST_SENT_AT = 0.0
 TURN_DISPLAY_TTL_SECONDS = 180.0
 ROLE_BINDING = plumbmate_role_binding.RoleBinding() if plumbmate_role_binding else None
 ROLE_SETUP = plumbmate_role_setup_ui.RoleSetupUI() if plumbmate_role_setup_ui else None
+CHAT_UI = plumbmate_chat_ui.ChatUI() if plumbmate_chat_ui else None
 
 
 def _mod_directory():
@@ -432,32 +441,51 @@ def plumbmate_status(_connection=None):
     output("autostart: {}".format(AUTOSTART_STATE))
 
 
+def _submit_chat(message, connection, output):
+    """The only send path for both UI and console. No hidden UI-only bypass."""
+    if plumbmate_chat_input is None:
+        raise ValueError("대화 입력 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
+    message = plumbmate_chat_input.validate_message(message)
+    sim, partner = _bound_player(connection)
+    if (_LAST_REQUEST_ID is not None and _LAST_ROLE_BINDING == ROLE_BINDING.binding_id
+            and _LAST_DISPLAYED_ID != _LAST_REQUEST_ID
+            and time.monotonic() - _LAST_SENT_AT < TURN_DISPLAY_TTL_SECONDS):
+        status = plumbmate_turn_bridge.read_status(_bridge_directory(), _LAST_REQUEST_ID)
+        if status is None or status["phase"] != "failed":
+            raise ValueError("앞서 보낸 대화가 있어요. plumbmate.read로 확인해 주세요. 중복 전송하지 않았어요.")
+    target = _write_request(sim, message)
+    try:
+        output("PlumbMate request queued: {}".format(os.path.basename(target)))
+    except Exception:
+        pass  # A failed console receipt must not turn a committed write into a retry.
+    return "{} → {} · 동반 앱에 요청을 남겼어요. 답변 확인: plumbmate.read".format(_sim_name(sim.sim_info), _sim_name(partner))
+
+
+def _chat_scope(connection):
+    _bound_player(connection)  # Recheck household, both live Sims and zone fence.
+    return ROLE_BINDING.binding_id, ROLE_BINDING.scene_id
+
+
+def _open_chat(connection, output):
+    if CHAT_UI is None:
+        raise ValueError("대화창 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
+    sim, partner = _bound_player(connection)
+    CHAT_UI.open(sim.sim_info, _sim_name(partner), _chat_scope(connection),
+                 lambda: _chat_scope(connection),
+                 lambda message: _submit_chat(message, connection, output), output)
+
+
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)
 def plumbmate_chat(*message_parts, _connection=None):
     output = sims4.commands.CheatOutput(_connection)
-    sim = _active_sim(_connection)
-    if sim is None:
+    if _active_sim(_connection) is None:
         output("PlumbMate: active Sim not found. Load a household first.")
         return
-    message = " ".join(_safe_text(part) for part in message_parts).strip()
-    if not message:
-        output("PlumbMate: enter a message after plumbmate.chat.")
-        return
-    if len(message) > 1000:
-        output("PlumbMate: 메시지는 1000자까지 보낼 수 있어요. 내용을 줄여 주세요. 아직 전송하지 않았어요.")
-        return
     try:
-        sim, partner = _bound_player(_connection)
-        if (_LAST_REQUEST_ID is not None and _LAST_ROLE_BINDING == ROLE_BINDING.binding_id
-                and _LAST_DISPLAYED_ID != _LAST_REQUEST_ID
-                and time.monotonic() - _LAST_SENT_AT < TURN_DISPLAY_TTL_SECONDS):
-            status = plumbmate_turn_bridge.read_status(_bridge_directory(), _LAST_REQUEST_ID)
-            if status is None or status["phase"] != "failed":
-                output("앞서 보낸 대화가 있어요. plumbmate.read로 확인해 주세요. 중복 전송하지 않았어요.")
-                return
-        target = _write_request(sim, message)
-        output("{} → {} · 응답 준비 중. 표시: plumbmate.read".format(_sim_name(sim.sim_info), _sim_name(partner)))
-        output("PlumbMate request queued: {}".format(os.path.basename(target)))
+        if not message_parts:
+            _open_chat(_connection, output)
+        else:
+            output(_submit_chat(" ".join(_safe_text(part) for part in message_parts), _connection, output))
     except Exception as exc:
         output("PlumbMate request failed: {}".format(_safe_text(exc)))
 

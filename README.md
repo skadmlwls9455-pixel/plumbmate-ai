@@ -28,8 +28,10 @@ actions yet.
 1. In this alpha, use `plumbmate.setup` to choose the player Sim and AI partner
    separately from the same household. At least two Sims are needed; the mod
    never creates one. Roles reset across zone/household replacement and restart.
-2. The game-side script writes a compact JSON request when the player runs
-   `plumbmate.chat <message>` in the cheat console.
+2. Run `plumbmate.chat` with no arguments to open the experimental native input
+   dialog. It names the recipient; only the Send button submits. The developer
+   console form `plumbmate.chat <message>` remains available through the same
+   validation/send path.
 3. The local companion validates both roles before reserving an attempt, then asks a configured provider for a
    short Korean reply plus one structured action suggestion.
 4. The response is written back to the local bridge directory.
@@ -38,11 +40,19 @@ actions yet.
    responses from a previous role binding and replies older than 180 real seconds
    are not displayed. It never reads another turn's newest file.
 
-The native picker and notification adapters are **not yet live-verified** in this
-alpha. Matching alpha.3 game and companion code is required; older companions
-reject the added role fields. There is still no ordinary chat input window or
-automatic response delivery. The mock provider explicitly labels connection-test
-replies; they are not autonomous AI play. See the [role checkpoint](docs/CHECKPOINT_2026-09-08_ROLES_KO.md).
+The native picker, input dialog and notification adapters are **not yet
+live-verified** in this alpha. Use matching alpha.4 game/companion sources; older
+pre-role companions reject the added role fields. There is still no in-game
+menu entry or automatic response delivery. The mock provider explicitly labels
+connection-test replies; they are not autonomous AI play. See the
+[composer checkpoint](docs/CHECKPOINT_2026-09-09_CHAT_KO.md).
+
+Composer input is validated at 1000 Unicode code points without normalization
+or prefix truncation. Its native field ceiling is 2000 to allow for UTF-16 emoji
+counting; actual IME/paste behavior still needs live testing. A rejected or
+blocked draft is retained only in bounded local process memory for reopening
+in the same role/scene. Cancel, successful submission, or reopening in a changed
+scope clears it. Opening a dialog alone does not create a request or call a model.
 
 The current game-side adapter reports only a safe, small identity/household
 snapshot. Action execution is intentionally disabled in this first milestone.
@@ -156,8 +166,9 @@ The model is intentionally not hard-coded. This avoids silently switching cost
 or behavior when model availability changes. Requests use `store: false`.
 Persistent RP memory restoration is currently **disabled** until save-scope
 receipts are connected; model-generated memory patches are not stored as facts.
-Retrieval, model routing, persistent role/profile settings and ordinary-player
-chat UI remain future work. The current role picker is a session-only prototype.
+Retrieval, model routing, persistent role/profile settings and a console-free
+chat workflow remain future work. The current role picker and composer are
+session-only prototypes with live UI/IME verification outstanding.
 Usage accounting and daily/cumulative/per-request USD limits are
 implemented locally but have not been tested with a billable provider call.
 See [current architecture](docs/ARCHITECTURE.md)
@@ -172,6 +183,8 @@ python -m plumbmate.cli doctor --bridge .plumbmate --connect
 The full implementation/verification gaps and next UX work are tracked in the
 [2026-09-07 checkpoint](docs/CHECKPOINT_2026-09-07_KO.md), followed by the
 [2026-09-08 role checkpoint](docs/CHECKPOINT_2026-09-08_ROLES_KO.md).
+The latest input-dialog work is in the
+[2026-09-09 composer checkpoint](docs/CHECKPOINT_2026-09-09_CHAT_KO.md).
 
 ## Build the game-side archive
 

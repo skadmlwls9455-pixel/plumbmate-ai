@@ -112,6 +112,8 @@ class AutostartTests(unittest.TestCase):
         _load_root_module("plumbmate_turn_bridge", "turn_bridge.py")
         _load_root_module("plumbmate_role_binding", "role_binding.py")
         _load_root_module("plumbmate_role_setup_ui", "role_setup_ui.py")
+        _load_root_module("plumbmate_chat_input", "chat_input.py")
+        _load_root_module("plumbmate_chat_ui", "chat_ui.py")
         spec = importlib.util.spec_from_file_location(
             "plumbmate_boot_under_test", self.boot_source
         )
@@ -481,6 +483,45 @@ class AutostartTests(unittest.TestCase):
         module.plumbmate_chat("hello", _connection=7)
         module.plumbmate_chat("again", _connection=7)
         self.assertEqual(len(list((self.mods_root / "PlumbMateBridge/requests").glob("*.json"))), 1)
+
+    def test_bare_chat_opens_composer_without_creating_request(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        with mock.patch.object(module.CHAT_UI, "open") as opened, mock.patch.object(module, "_write_request") as write:
+            module.plumbmate_chat(_connection=7)
+        opened.assert_called_once()
+        write.assert_not_called()
+
+    def test_composer_uses_shared_send_path_and_blocks_pending_console_turn(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        with mock.patch.object(module.CHAT_UI, "open") as opened:
+            module.plumbmate_chat(_connection=7)
+        submit = opened.call_args.args[4]
+        module.plumbmate_chat("console turn", _connection=7)
+        with self.assertRaises(ValueError):
+            submit("dialog turn")
+        self.assertEqual(len(list((self.mods_root / "PlumbMateBridge/requests").glob("*.json"))), 1)
+
+    def test_console_and_composer_apply_same_unicode_validation(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        with mock.patch.object(module, "_write_request") as write:
+            module.plumbmate_chat("hi\x00", _connection=7)
+            with self.assertRaises(ValueError):
+                module._submit_chat("hi\x00", 7, lambda _: None)
+        write.assert_not_called()
+
+    def test_composer_context_callback_detects_reassignment_and_zone_change(self):
+        module = self.boot()
+        current, _, _ = self._ready_role_pair(module)
+        with mock.patch.object(module.CHAT_UI, "open") as opened:
+            module.plumbmate_chat(_connection=7)
+        scope, scope_now = opened.call_args.args[2:4]
+        self.assertEqual(scope_now(), scope)
+        current["zone"] = object()
+        with self.assertRaises(ValueError):
+            scope_now()
 
     def test_notification_is_shown_once_for_exact_turn(self):
         from plumbmate.engine import CompanionEngine

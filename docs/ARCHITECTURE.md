@@ -1,13 +1,15 @@
 # Architecture: implemented foundation vs target product
 
-Updated 2026-09-08 (local checkpoint). The master RFC map describes a target, not shipped behavior.
+Updated 2026-09-09 (local checkpoint). The master RFC map describes a target, not shipped behavior.
 
 ## Current responsibilities
 
 - `game_mod/commands.py`: EA snapshot queries, cheat registration/output, bridge startup configuration.
 - `game_mod/role_binding.py`: pure session-only player/partner binding, object/ID identity fences. No game APIs, persistence or transport.
 - `game_mod/role_setup_ui.py`: optional native two-step picker and notification adapter. No Sim creation or model calls; display remains live-unverified.
-- `game_mod/turn_bridge.py`: bounded file requests/responses and user-facing turn receipts. Runs only from explicit commands, never the tick pump.
+- `game_mod/chat_input.py`: bounded Unicode validation and single-draft/single-use composer tickets, with role/scene fencing. No EA APIs or persistence.
+- `game_mod/chat_ui.py`: optional native text-input adapter and non-narrative submission feedback. Calls the same guarded send function as console chat; never retries or polls files.
+- `game_mod/turn_bridge.py`: bounded file requests/responses and user-facing turn receipts. Runs only on explicit commands/Send, never the tick pump.
 - `game_mod/tick_driver.py`: hook ownership, suspension, bounded pump scheduling.
 - `game_mod/bridge_client.py`: nonblocking, literal-loopback transport and authentication on the engine thread. No model calls or worker threads here.
 - `companion/contracts.py` + `schemas/`: canonical shape/type/length/allow-list contracts, compiled once at companion startup. Provider-generated fields derive from the response contract; identifiers remain locally owned.
@@ -32,6 +34,7 @@ Updated 2026-09-08 (local checkpoint). The master RFC map describes a target, no
 6. API uncertainty does not trigger automatic retries during normal single-engine processing. Connection retries are independent from paid model retries.
 7. Sequential server lifecycle control: stop admissions before sweeping connections. Retain timed-out worker references and refuse restart while old workers survive.
 8. The selected Sim is not the AI identity. Require a matching role binding; reject missing/ambiguous roles before provider/attempt use. Role/zone replacement invalidates display of previous requests. These in-memory fences are NOT verified save lineage.
+9. Opening/cancelling a dialog does not send. Duplicate or superseded UI callbacks cannot submit. A feedback failure after a committed request must not trigger another request. Drafts never enter memory/archives until explicit Send creates a turn request.
 
 ## Resource and privacy limits
 
@@ -56,7 +59,7 @@ play text; retention, export, deletion UI, and disk quotas remain release work.
 
 ## Not implemented yet
 
-The autonomous NPC-like partner, durable partner/profile settings, observed event
+The console-free/auto-delivered conversation, autonomous NPC-like partner, durable partner/profile settings, observed event
 atomization, verified save/branch receipts, memory DB/retrieval, L0–L3 router,
 IC scheduler, and relationship features remain separate milestones. Pure
 save-lineage and state-delta helpers exist but are not proof of end-to-end use.
@@ -80,6 +83,8 @@ still need a new build/install; see the exact artifact hash and limitations in
 [the checkpoint](CHECKPOINT_2026-09-07_KO.md). The newer alpha.3 role and
 notification adapter build is not installed/live-tested yet; see
 [the role checkpoint](CHECKPOINT_2026-09-08_ROLES_KO.md).
+The alpha.4 input adapter adds hash-pinned native message-method tests, not
+native display or IME proof; see [the composer checkpoint](CHECKPOINT_2026-09-09_CHAT_KO.md).
 
 Before a release: live-verified role UX, response/save-scope isolation,
 general durable request claiming (paid IDs are protected by the spending ledger),
