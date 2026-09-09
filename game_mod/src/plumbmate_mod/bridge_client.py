@@ -54,6 +54,7 @@ INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 30.0
 ACK_TIMEOUT_SECONDS = 15.0
 KEEPALIVE_SECONDS = 60.0
+DELIVERY_CAPABILITY = "turn_delivery_v1"
 
 # Must stay identical to the companion's transport allow list. It bounds what
 # the socket carries and says nothing about whether an event may be acted on.
@@ -64,6 +65,7 @@ ALLOWED_EVENT_KINDS = frozenset((
     "save_committed",
     "interaction_started",
     "chat_turn",
+    "turn_poll",
 ))
 
 DISCONNECTED = "DISCONNECTED"
@@ -189,6 +191,27 @@ class BridgeClient(object):
         self._outbox = []
         self._pending = []
         self._pending_since = {}
+        self.supports_turn_delivery = False
+        self._delivery_event_id = None
+        self._delivery_reply = None
+
+    def request_turn_delivery(self, scope):
+        """One read-only lookup in flight, never a model call or resend."""
+        if not self.connected or not self.supports_turn_delivery or self._delivery_event_id:
+            return None
+        self._delivery_event_id = self.queue_event("turn_poll", scope)
+        return self._delivery_event_id
+
+    def take_turn_delivery(self):
+        reply, self._delivery_reply = self._delivery_reply, None
+        return reply
+
+    def _clear_delivery(self):
+        # Unlike user events, unsent lookups must not survive a connection epoch.
+        self._outbox = [item for item in self._outbox if item[0] != self._delivery_event_id]
+        self._delivery_event_id = None
+        self._delivery_reply = None
+        self.supports_turn_delivery = False
 
     @property
     def connected(self):
@@ -239,6 +262,7 @@ class BridgeClient(object):
 
     def close(self):
         """Release the socket. Queued events are kept; in-flight ones are lost."""
+        self._clear_delivery()
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
         self._pending_since.clear()
@@ -371,6 +395,7 @@ class BridgeClient(object):
             self._write_frame({
                 "protocol_version": PROTOCOL_VERSION, "kind": "hello",
                 "proof": _proof(self._token, nonce),
+                "capabilities": [DELIVERY_CAPABILITY],
             })
             self.state = AWAITING_WELCOME
         elif self.state == AWAITING_WELCOME:
@@ -378,12 +403,20 @@ class BridgeClient(object):
                 self._fail(str(frame.get("reason", "handshake_refused")))
                 return
             self.state = READY
+            capabilities = frame.get("capabilities", [])
+            self.supports_turn_delivery = (isinstance(capabilities, list)
+                                           and DELIVERY_CAPABILITY in capabilities)
             self._backoff = 0.0
             self.last_error = None
             self.stats["handshakes"] += 1
             self._next_keepalive = self._now() + self._keepalive
         elif self.state == READY:
             if kind == "ack":
+                if (frame.get("event_id") == self._delivery_event_id
+                        and self._delivery_event_id in self._pending):
+                    delivery = frame.get("delivery")
+                    if isinstance(delivery, dict):
+                        self._delivery_reply = delivery
                 self._resolve(frame.get("event_id"), True, None)
             elif kind == "error":
                 self._resolve(frame.get("event_id"), False, frame.get("reason"))
@@ -395,6 +428,8 @@ class BridgeClient(object):
             self.stats["unknown_frames"] += 1
             return
         self._pending.remove(event_id)
+        if event_id == self._delivery_event_id:
+            self._delivery_event_id = None
         self._pending_since.pop(event_id, None)
         if accepted:
             self.stats["acked_events"] += 1
@@ -434,6 +469,7 @@ class BridgeClient(object):
             written += sent
 
     def _fail(self, reason):
+        self._clear_delivery()
         self.stats["failures"] += 1
         # In-flight events have an unknown outcome and are never resent.
         self.stats["lost_events"] += len(self._pending)

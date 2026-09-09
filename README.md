@@ -35,17 +35,19 @@ actions yet.
 3. The local companion validates both roles before reserving an attempt, then asks a configured provider for a
    short Korean reply plus one structured action suggestion.
 4. The response is written back to the local bridge directory.
-5. `plumbmate.read` attempts to show that request's reply on the notification wall
-   (console fallback). Pending/failed status stays in the console. Repeated reads,
+5. With a matching companion, the pending reply arrives on the notification wall
+   automatically (console fallback). `plumbmate.read` remains a manual recovery
+   command. Automatic failures are system notices, not character dialogue. Repeated reads,
    responses from a previous role binding and replies older than 180 real seconds
    are not displayed. It never reads another turn's newest file.
 
 The native picker, input dialog and notification adapters are **not yet
-live-verified** in this alpha. Use matching alpha.4 game/companion sources; older
+live-verified** in this alpha. Use matching alpha.5 game/companion sources; older
 pre-role companions reject the added role fields. There is still no in-game
-menu entry or automatic response delivery. The mock provider explicitly labels
+menu entry. Automatic delivery is integration-tested, not yet live-verified.
+The mock provider explicitly labels
 connection-test replies; they are not autonomous AI play. See the
-[composer checkpoint](docs/CHECKPOINT_2026-09-09_CHAT_KO.md).
+[automatic delivery checkpoint](docs/CHECKPOINT_2026-09-09_DELIVERY_KO.md).
 
 Composer input is validated at 1000 Unicode code points without normalization
 or prefix truncation. Its native field ceiling is 2000 to allow for UTF-16 emoji
@@ -85,6 +87,17 @@ rotating it requires `plumbmate.bridge.start` or a game restart.
 
 The socket is loopback-only and authenticated per connection with an HMAC
 answer to the server's nonce; the token itself is never sent.
+
+Automatic replies negotiate `turn_delivery_v1`. Only one pending turn is
+checked, at most once per real second, for up to 180 seconds after Send. This
+interval is a PlumbMate UX default, **not an EA requirement**. Reads happen in
+the companion; the game tick uses the nonblocking socket and memory only.
+Queries never generate dialogue or make API calls. Request/binding/scene IDs
+must match, and the original request must corroborate a reply's scope. A
+zone/household/role change or an off-lot participant cancels the automatic watch.
+Stopping the bridge cancels it too; a manual read remains available if the turn
+is still eligible. Old companions negotiate no capability and retain manual
+delivery. TTL hides late replies; it does not cancel or refund a model call.
 
 See [bridge reliability fixes and verification](docs/BRIDGE_FIXES_2026-09-05_KO.md)
 for the four reviewed defects, regression coverage, and remaining in-game checks.

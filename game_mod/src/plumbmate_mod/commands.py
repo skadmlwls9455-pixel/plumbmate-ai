@@ -34,6 +34,10 @@ try:
     import plumbmate_chat_ui
 except Exception:
     plumbmate_chat_ui = None
+try:
+    import plumbmate_reply_delivery
+except Exception:
+    plumbmate_reply_delivery = None
 
 # The build publishes these as root-level modules, like the diagnostic probe.
 # A partial or stale install must degrade to the filesystem bridge, not break
@@ -61,7 +65,7 @@ except Exception as _exc:
 
 
 PROTOCOL_VERSION = "0.1"
-MOD_VERSION = "0.1.1-alpha.4"
+MOD_VERSION = "0.1.1-alpha.5"
 DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
 
@@ -81,6 +85,7 @@ TURN_DISPLAY_TTL_SECONDS = 180.0
 ROLE_BINDING = plumbmate_role_binding.RoleBinding() if plumbmate_role_binding else None
 ROLE_SETUP = plumbmate_role_setup_ui.RoleSetupUI() if plumbmate_role_setup_ui else None
 CHAT_UI = plumbmate_chat_ui.ChatUI() if plumbmate_chat_ui else None
+REPLY_DELIVERY = plumbmate_reply_delivery.ReplyDelivery() if plumbmate_reply_delivery else None
 
 
 def _mod_directory():
@@ -371,6 +376,8 @@ def plumbmate_bridge_stop(_connection=None):
     global _BOUND_ENDPOINT, _BOOTSTRAP_CLIENT, AUTOSTART_STATE
     output = sims4.commands.CheatOutput(_connection)
     AUTOSTART_STATE = "stopped_by_command"
+    if REPLY_DELIVERY is not None:
+        REPLY_DELIVERY.stop("stopped")
     _BOUND_ENDPOINT = None
     bootstrap, _BOOTSTRAP_CLIENT = _BOOTSTRAP_CLIENT, None
     try:
@@ -454,11 +461,14 @@ def _submit_chat(message, connection, output):
         if status is None or status["phase"] != "failed":
             raise ValueError("앞서 보낸 대화가 있어요. plumbmate.read로 확인해 주세요. 중복 전송하지 않았어요.")
     target = _write_request(sim, message)
+    if REPLY_DELIVERY is not None:
+        REPLY_DELIVERY.start(_LAST_REQUEST_ID, ROLE_BINDING.binding_id,
+                             ROLE_BINDING.scene_id, connection, _LAST_SENT_AT)
     try:
         output("PlumbMate request queued: {}".format(os.path.basename(target)))
     except Exception:
         pass  # A failed console receipt must not turn a committed write into a retry.
-    return "{} → {} · 동반 앱에 요청을 남겼어요. 답변 확인: plumbmate.read".format(_sim_name(sim.sim_info), _sim_name(partner))
+    return "{} → {} · 요청을 남겼어요. 자동 수신 연결이 있으면 알림 담벼락에 답변이 도착해요. 수동 확인: plumbmate.read".format(_sim_name(sim.sim_info), _sim_name(partner))
 
 
 def _chat_scope(connection):
@@ -492,18 +502,12 @@ def plumbmate_chat(*message_parts, _connection=None):
 
 @sims4.commands.Command("plumbmate.read", command_type=sims4.commands.CommandType.Live)
 def plumbmate_read(_connection=None):
-    global _LAST_DISPLAYED_ID
     output = sims4.commands.CheatOutput(_connection)
     try:
         sim, partner = _bound_player(_connection)
-        if _LAST_REQUEST_ID is None or _LAST_ROLE_BINDING != ROLE_BINDING.binding_id:
-            output("이 역할 설정에서 보낸 대화가 없어요. 이전 설정의 답변은 표시하지 않아요.")
-            return
-        if _LAST_DISPLAYED_ID == _LAST_REQUEST_ID:
-            output("이미 표시한 답변이에요. 알림 담벼락 또는 콘솔에서 확인해 주세요.")
-            return
-        if time.monotonic() - _LAST_SENT_AT >= TURN_DISPLAY_TTL_SECONDS:
-            output("보낸 지 오래된 답변은 표시하지 않아요. 필요하면 새로 대화해 주세요.")
+        reason = _reply_ineligible_reason()
+        if reason:
+            output(reason)
             return
         response = _latest_response()
         if response is None:
@@ -511,32 +515,80 @@ def plumbmate_read(_connection=None):
             if status is None:
                 output("PlumbMate: 응답 대기 중. 동반 앱이 켜져 있는지 확인해 주세요.")
             elif status["phase"] == "failed":
-                messages = {
-                    "invalid_request": "요청 형식이 맞지 않아 처리하지 못했어요.",
-                    "provider_failed": "모델 응답에 실패했어요. 중복 호출 방지를 위해 자동 재시도하지 않아요.",
-                    "session_limit": "이번 세션의 호출 한도에 도달했어요. 동반 앱에서 한도를 확인해 주세요.",
-                    "spending_blocked": "금액 한도 또는 미확정 과금 때문에 호출을 멈췄어요. 동반 앱의 budget status를 확인해 주세요.",
-                    "roles_required": "역할 설정이 맞지 않아요. plumbmate.setup으로 다시 선택해 주세요.",
-                }
-                output("PlumbMate: " + messages.get(status["reason_code"], "응답을 처리하지 못했어요."))
+                output("PlumbMate: " + _failure_message(status["reason_code"]))
             else:
                 output("PlumbMate: 동반 앱에서 요청을 처리하고 있어요.")
             return
-        action = response.get("action", {})
-        message = _safe_text(response.get("partner_message", ""))
-        try:
-            plumbmate_role_setup_ui.notify(partner, "PlumbMate · " + _sim_name(partner), message)
-        except Exception:
-            output(message)
-            output("알림을 표시하지 못해 콘솔에 답변을 표시했어요.")
-        _LAST_DISPLAYED_ID = _LAST_REQUEST_ID
-        output("Suggested action: {} | {}".format(
-            _safe_text(action.get("name", "suggest_only")),
-            _safe_text(action.get("reason", "")),
-        ))
-        output("Automatic execution is disabled in prototype 0.1.")
+        _show_response(response, partner, output)
     except Exception as exc:
         output("PlumbMate response failed: {}".format(_safe_text(exc)))
+
+
+def _reply_ineligible_reason():
+    """One display gate shared by manual reads and automatic socket delivery."""
+    if _LAST_REQUEST_ID is None or _LAST_ROLE_BINDING != ROLE_BINDING.binding_id:
+        return "이 역할 설정에서 보낸 대화가 없어요. 이전 설정의 답변은 표시하지 않아요."
+    if _LAST_DISPLAYED_ID == _LAST_REQUEST_ID:
+        return "이미 표시한 답변이에요. 알림 담벼락 또는 콘솔에서 확인해 주세요."
+    if time.monotonic() - _LAST_SENT_AT >= TURN_DISPLAY_TTL_SECONDS:
+        return "보낸 지 오래된 답변은 표시하지 않아요. 필요하면 새로 대화해 주세요."
+    return None
+
+
+def _failure_message(reason):
+    return (plumbmate_reply_delivery.failure_message(reason) if plumbmate_reply_delivery
+            else "응답을 처리하지 못했어요. 동반 앱 상태를 확인해 주세요.")
+
+
+def _show_response(response, partner, output):
+    global _LAST_DISPLAYED_ID
+    response = plumbmate_turn_bridge.validate_response(response, _LAST_REQUEST_ID)
+    try:
+        plumbmate_role_setup_ui.notify(partner, "PlumbMate · " + _sim_name(partner), response["partner_message"])
+    except Exception:
+        output(response["partner_message"])
+        output("알림을 표시하지 못해 콘솔에 답변을 표시했어요.")
+    _LAST_DISPLAYED_ID = _LAST_REQUEST_ID
+    if REPLY_DELIVERY is not None:
+        REPLY_DELIVERY.stop()
+    # Suggestions remain inert, regardless of which delivery channel was used.
+    output("Suggested action: {} | {}".format(response["action"]["name"],
+                                               _safe_text(response["action"].get("reason", ""))))
+    output("Automatic execution is disabled in prototype 0.1.")
+
+
+def _reply_scope(connection):
+    scope = _chat_scope(connection)
+    reason = _reply_ineligible_reason()
+    if reason:
+        raise ValueError(reason)
+    return scope
+
+
+def _receive_reply(reply, connection):
+    global _LAST_DISPLAYED_ID
+    sim, partner = _bound_player(connection)
+    if _reply_ineligible_reason():
+        return
+    output = sims4.commands.CheatOutput(connection)
+    if reply["phase"] == "completed":
+        _show_response(reply.get("response"), partner, output)
+    else:
+        # System failure is not character dialogue or a fictional excuse.
+        message = _failure_message(reply.get("reason_code"))
+        try:
+            plumbmate_role_setup_ui.notify(sim.sim_info, "PlumbMate · 연결 안내", message)
+        except Exception:
+            output(message)
+        _LAST_DISPLAYED_ID = _LAST_REQUEST_ID
+
+
+def _on_reply_tick(client):
+    if REPLY_DELIVERY is None or REPLY_DELIVERY.scope is None:
+        return
+    connection = REPLY_DELIVERY.connection
+    REPLY_DELIVERY.advance(client, lambda: _reply_scope(connection),
+                            lambda reply: _receive_reply(reply, connection))
 
 
 @sims4.commands.Command("plumbmate.setup", command_type=sims4.commands.CommandType.Live)
@@ -553,6 +605,8 @@ def plumbmate_setup(_connection=None):
 # Mod load runs this. It must not raise: an exception during import would leave
 # the game without the commands above, which are the only way to diagnose it.
 try:
+    if TICK_DRIVER is not None:
+        TICK_DRIVER.after_pump = _on_reply_tick
     start_autostart()
 except Exception as _exc:
     AUTOSTART_STATE = "autostart_raised: {}: {}".format(type(_exc).__name__, _exc)

@@ -63,10 +63,18 @@ def read_response(root, request_id):
     response = _read(os.path.join(root, "responses", request_id + ".json"))
     if response is None:
         return None
+    return validate_response(response, request_id)
+
+
+def validate_response(response, request_id):
+    """Same display contract for file and socket replies; this part is pure."""
+    if not _valid_id(request_id) or not isinstance(response, dict):
+        raise ValueError("Invalid response envelope")
     if response.get("request_id") != request_id or response.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError("Response does not match the pending turn")
     if not isinstance(response.get("partner_message"), str) or len(response["partner_message"]) > 500:
         raise ValueError("Invalid response text")
+    response["partner_message"].encode("utf-8")  # Reject lone surrogates before native UI.
     action = response.get("action")
     if not isinstance(action, dict) or action.get("name") not in (
             "suggest_only", "queue_social", "queue_self_interaction", "cancel_current"):

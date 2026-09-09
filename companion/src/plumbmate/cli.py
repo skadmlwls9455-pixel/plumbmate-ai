@@ -160,7 +160,9 @@ def _main(argv: list[str] | None = None) -> int:
             engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
         # The socket layer is loopback-only and refuses to start without a token.
         try:
-            server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port))
+            from .turn_delivery import TurnDeliveryReader
+            server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port),
+                                       delivery_reader=TurnDeliveryReader(paths))
             server.start()
         except (OSError, SocketBridgeError) as exc:
             print(f"Listener not started: {exc}. Check the token/configuration and port owner; "
