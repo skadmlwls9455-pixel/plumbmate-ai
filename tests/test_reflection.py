@@ -30,6 +30,7 @@ def request(message, session=SESSION):
         "created_at": "2026-09-06T00:00:00+00:00", "player_message": message,
         "session_id": session, "actor": {"sim_id": 1, "name": "케이트"},
         "household": [{"sim_id": 1, "name": "케이트"}, {"sim_id": 2, "name": "에이든"}],
+        "roles": {"binding_id": "a" * 32, "scene_id": "b" * 32, "player_sim_id": 1, "partner_sim_id": 2},
         "recent_events": [], "memory_summary": "",
     }
 

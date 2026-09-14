@@ -21,6 +21,8 @@ from .memory import MAX_SUMMARY_CHARS, MemoryStore
 from .reflection import maintain
 from .providers import Provider
 from .turn_status import write_turn_status
+from .pricing import SpendingBlocked
+from .dialogue import RoleSetupRequired, dialogue_context
 
 
 class CompanionEngine:
@@ -100,8 +102,10 @@ class CompanionEngine:
                 else:
                     request.pop("drive_state", None)
                 request = clamp_request(request)
-            except ProtocolError:
-                write_turn_status(self.paths, request_path.stem, "failed", "invalid_request")
+                dialogue_context(request)
+            except ProtocolError as exc:
+                reason = "roles_required" if isinstance(exc, RoleSetupRequired) else "invalid_request"
+                write_turn_status(self.paths, request_path.stem, "failed", reason)
                 self._quarantine(request_path)
                 continue
             response_path = self.paths.responses / f"{request['request_id']}.json"
@@ -125,8 +129,11 @@ class CompanionEngine:
                 atomic_write_json(response_path, response)
             except Exception as exc:
                 # Timeouts may already incur charges: retain, never auto-retry.
-                write_turn_status(self.paths, request["request_id"], "failed", "provider_failed")
+                reason = "spending_blocked" if isinstance(exc, SpendingBlocked) else "provider_failed"
+                write_turn_status(self.paths, request["request_id"], "failed", reason)
                 self._quarantine(request_path)
+                if isinstance(exc, SpendingBlocked):
+                    raise SpendingBlocked(str(exc)) from None
                 raise ProtocolError("Turn failed; retained in archive/rejected; no automatic retry") from exc
             shutil.move(str(request_path), str(self.paths.archive / request_path.name))
             write_turn_status(self.paths, request["request_id"], "completed")

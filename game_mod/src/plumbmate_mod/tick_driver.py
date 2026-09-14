@@ -49,10 +49,12 @@ class TickDriver(object):
         binder=None,
         bind_interval_seconds=DEFAULT_BIND_INTERVAL_SECONDS,
         now=None,
+        after_pump=None,
     ):
         if int(every_n_ticks) < 1:
             raise ValueError("every_n_ticks must be at least 1")
         self._client = client
+        self.after_pump = after_pump
         self._every = int(every_n_ticks)
         self._max_consecutive_errors = int(max_consecutive_errors)
         self._binder = binder
@@ -151,6 +153,8 @@ class TickDriver(object):
         self._counter = 0
         try:
             self.last_state = self._client.pump()
+            if self.after_pump is not None:
+                self.after_pump(self._client)
         except BaseException as exc:
             # pump() already fails closed; this is the last line before the engine.
             self._consecutive_errors += 1

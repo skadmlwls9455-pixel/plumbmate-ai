@@ -108,8 +108,13 @@ class AutostartTests(unittest.TestCase):
         sys.modules.update(_install_game_stubs())
         sys.modules["zone"].Zone = self.zone_class
         _load_root_module("plumbmate_bridge_client", "bridge_client.py")
+        _load_root_module("plumbmate_reply_delivery", "reply_delivery.py")
         _load_root_module("plumbmate_tick_driver", "tick_driver.py")
         _load_root_module("plumbmate_turn_bridge", "turn_bridge.py")
+        _load_root_module("plumbmate_role_binding", "role_binding.py")
+        _load_root_module("plumbmate_role_setup_ui", "role_setup_ui.py")
+        _load_root_module("plumbmate_chat_input", "chat_input.py")
+        _load_root_module("plumbmate_chat_ui", "chat_ui.py")
         spec = importlib.util.spec_from_file_location(
             "plumbmate_boot_under_test", self.boot_source
         )
@@ -426,7 +431,13 @@ class AutostartTests(unittest.TestCase):
 
         module = self.boot()
         info = types.SimpleNamespace(sim_id=42, full_name="Test Partner", age="ADULT", gender="X")
-        sim = types.SimpleNamespace(sim_info=info)
+        partner = types.SimpleNamespace(sim_id=43, full_name="Other Sim", get_sim_instance=lambda: object())
+        members = [info, partner]
+        household = types.SimpleNamespace(sim_info_gen=lambda: iter(members))
+        sim = types.SimpleNamespace(sim_info=info, household=household)
+        zone_obj = object()
+        module.services.current_zone = lambda: zone_obj
+        module.ROLE_BINDING.bind(zone_obj, household, info, partner, members)
         manager = types.SimpleNamespace(get=lambda connection: types.SimpleNamespace(active_sim=sim))
         lines = []
         with mock.patch.object(module.services, "client_manager", return_value=manager), \
@@ -440,12 +451,226 @@ class AutostartTests(unittest.TestCase):
             module.plumbmate_read(_connection=7)
         self.assertTrue(any("오늘 같이 산책할까?" in line for line in lines))
 
+    def _ready_role_pair(self, module):
+        player = types.SimpleNamespace(sim_id=10, full_name="Player")
+        partner = types.SimpleNamespace(sim_id=11, full_name="Partner")
+        members = [player, partner]
+        household = types.SimpleNamespace(sim_info_gen=lambda: iter(members))
+        player_sim = types.SimpleNamespace(sim_info=player, household=household)
+        partner_sim = types.SimpleNamespace(sim_info=partner, household=household)
+        player.get_sim_instance = lambda: player_sim
+        partner.get_sim_instance = lambda: partner_sim
+        current = {"selected": player_sim, "zone": object()}
+        module.services.client_manager = lambda: types.SimpleNamespace(
+            get=lambda _: types.SimpleNamespace(active_sim=current["selected"]))
+        module.services.current_zone = lambda: current["zone"]
+        module.ROLE_BINDING.bind(current["zone"], household, player, partner, members)
+        return current, player_sim, partner_sim
+
+    def test_changing_selected_sim_does_not_swap_player_and_ai(self):
+        from plumbmate.protocol import read_json
+        module = self.boot()
+        current, player, partner = self._ready_role_pair(module)
+        current["selected"] = partner
+        module.plumbmate_chat("hello", "partner", _connection=7)
+        path, = (self.mods_root / "PlumbMateBridge/requests").glob("*.json")
+        request = read_json(path)
+        self.assertEqual(request["actor"]["sim_id"], player.sim_info.sim_id)
+        self.assertEqual(request["roles"]["partner_sim_id"], partner.sim_info.sim_id)
+
+    def test_chat_double_submit_creates_only_one_request(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        module.plumbmate_chat("again", _connection=7)
+        self.assertEqual(len(list((self.mods_root / "PlumbMateBridge/requests").glob("*.json"))), 1)
+
+    def test_bare_chat_opens_composer_without_creating_request(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        with mock.patch.object(module.CHAT_UI, "open") as opened, mock.patch.object(module, "_write_request") as write:
+            module.plumbmate_chat(_connection=7)
+        opened.assert_called_once()
+        write.assert_not_called()
+
+    def test_composer_uses_shared_send_path_and_blocks_pending_console_turn(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        with mock.patch.object(module.CHAT_UI, "open") as opened:
+            module.plumbmate_chat(_connection=7)
+        submit = opened.call_args.args[4]
+        module.plumbmate_chat("console turn", _connection=7)
+        with self.assertRaises(ValueError):
+            submit("dialog turn")
+        self.assertEqual(len(list((self.mods_root / "PlumbMateBridge/requests").glob("*.json"))), 1)
+
+    def test_console_and_composer_apply_same_unicode_validation(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        with mock.patch.object(module, "_write_request") as write:
+            module.plumbmate_chat("hi\x00", _connection=7)
+            with self.assertRaises(ValueError):
+                module._submit_chat("hi\x00", 7, lambda _: None)
+        write.assert_not_called()
+
+    def test_composer_context_callback_detects_reassignment_and_zone_change(self):
+        module = self.boot()
+        current, _, _ = self._ready_role_pair(module)
+        with mock.patch.object(module.CHAT_UI, "open") as opened:
+            module.plumbmate_chat(_connection=7)
+        scope, scope_now = opened.call_args.args[2:4]
+        self.assertEqual(scope_now(), scope)
+        current["zone"] = object()
+        with self.assertRaises(ValueError):
+            scope_now()
+
+    def test_notification_is_shown_once_for_exact_turn(self):
+        from plumbmate.engine import CompanionEngine
+        from plumbmate.protocol import BridgePaths
+        from plumbmate.providers import MockProvider
+        module = self.boot()
+        self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        CompanionEngine(BridgePaths(self.mods_root / "PlumbMateBridge"), MockProvider()).process_one()
+        with mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
+            module.plumbmate_read(_connection=7)
+            module.plumbmate_read(_connection=7)
+            notify.assert_called_once()
+
+    def test_old_zone_reply_is_not_even_read_from_disk(self):
+        module = self.boot()
+        current, _, _ = self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        current["zone"] = object()
+        with mock.patch.object(module, "_latest_response") as read:
+            module.plumbmate_read(_connection=7)
+            read.assert_not_called()
+
+    def test_automatic_reply_real_socket_to_notification_and_manual_dedup(self):
+        from plumbmate.engine import CompanionEngine
+        from plumbmate.protocol import BridgePaths
+        from plumbmate.providers import MockProvider
+        from plumbmate.turn_delivery import TurnDeliveryReader
+        paths = BridgePaths(self.mods_root / "PlumbMateBridge")
+        self.write_token()
+        with EventSocketServer(TOKEN, delivery_reader=TurnDeliveryReader(paths)) as server:
+            self.write_endpoint(server.port)
+            module = self.boot()
+            _, player, partner = self._ready_role_pair(module)
+            module.plumbmate_chat("오늘 같이", "산책할까? 🐙", _connection=7)
+            provider = mock.Mock(wraps=MockProvider())
+            CompanionEngine(paths, provider).process_one()
+            with mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify, \
+                    mock.patch.object(module.plumbmate_turn_bridge, "_read", side_effect=AssertionError("game tick file IO")), \
+                    mock.patch.object(module, "_latest_response", side_effect=AssertionError("manual file read")):
+                self.assertTrue(self.tick_until(self.zone_class(), lambda: notify.called, timeout=5))
+                notify.assert_called_once()
+                self.assertIs(notify.call_args.args[0], partner.sim_info)
+                self.assertIn("산책할까? 🐙", notify.call_args.args[2])
+                module.plumbmate_read(_connection=7)
+                for _ in range(100):
+                    self.zone_class().update(0)
+                notify.assert_called_once()
+            self.assertEqual(module._LAST_DISPLAYED_ID, module._LAST_REQUEST_ID)
+            provider.respond.assert_called_once()
+            self.assertEqual(server.drain(), [])
+
+    def test_pending_auto_watch_has_no_filesystem_or_thread_work_on_game_tick(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        client = mock.Mock(supports_turn_delivery=True)
+        client.take_turn_delivery.return_value = None
+        module.TICK_DRIVER.set_binder(None)
+        module.TICK_DRIVER.attach(client)
+        module.TICK_DRIVER.resume()
+        with mock.patch("builtins.open", side_effect=AssertionError("open")), \
+                mock.patch("os.stat", side_effect=AssertionError("stat")), \
+                mock.patch("os.makedirs", side_effect=AssertionError("mkdir")), \
+                mock.patch("threading.Thread", side_effect=AssertionError("thread")):
+            for _ in range(1000):
+                self.assertTrue(module.TICK_DRIVER.on_tick())
+        client.request_turn_delivery.assert_called_once()
+        self.assertEqual(module.TICK_DRIVER.stats["errors"], 0)
+
+    def test_automatic_reply_context_and_manual_first_fences(self):
+        for case in ("zone", "roles", "off_lot", "expired", "manual_first"):
+            module = self.boot()
+            current, _, partner = self._ready_role_pair(module)
+            module.plumbmate_chat("hello", _connection=7)
+            client = mock.Mock(supports_turn_delivery=True)
+            client.take_turn_delivery.return_value = dict(module.REPLY_DELIVERY.scope, phase="completed")
+            if case == "zone":
+                current["zone"] = object()
+            elif case == "roles":
+                self._ready_role_pair(module)
+            elif case == "off_lot":
+                partner.sim_info.get_sim_instance = lambda: None
+            elif case == "expired":
+                module._LAST_SENT_AT -= module.TURN_DISPLAY_TTL_SECONDS
+            else:
+                module._LAST_DISPLAYED_ID = module._LAST_REQUEST_ID
+            with self.subTest(case=case), mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
+                module._on_reply_tick(client)
+                notify.assert_not_called()
+            client.take_turn_delivery.assert_not_called()
+            self.assertIsNone(module.REPLY_DELIVERY.scope)
+
+    def test_automatic_failure_notice_once_and_new_turn_can_be_submitted(self):
+        module = self.boot()
+        self._ready_role_pair(module)
+        module.plumbmate_chat("hello", _connection=7)
+        previous = module._LAST_REQUEST_ID
+        client = mock.Mock(supports_turn_delivery=True)
+        client.take_turn_delivery.return_value = dict(module.REPLY_DELIVERY.scope,
+                                                       phase="failed", reason_code="spending_blocked")
+        with mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
+            module._on_reply_tick(client)
+            module._on_reply_tick(client)
+            notify.assert_called_once()
+            self.assertIn("금액 한도", notify.call_args.args[2])
+        module.plumbmate_chat("new explicit request", _connection=7)
+        self.assertNotEqual(previous, module._LAST_REQUEST_ID)
+
+    def test_reply_after_reassignment_or_ttl_is_not_displayed(self):
+        for case in ("reassignment", "ttl"):
+            module = self.boot()
+            self._ready_role_pair(module)
+            module.plumbmate_chat("hello", _connection=7)
+            if case == "reassignment":
+                self._ready_role_pair(module)
+            else:
+                module._LAST_SENT_AT -= module.TURN_DISPLAY_TTL_SECONDS
+            with self.subTest(case=case), mock.patch.object(module, "_latest_response") as read:
+                module.plumbmate_read(_connection=7)
+                read.assert_not_called()
+
+    def test_partner_off_lot_blocks_request_without_clearing_roles(self):
+        module = self.boot()
+        _, _, partner = self._ready_role_pair(module)
+        partner.sim_info.get_sim_instance = lambda: None
+        binding_id = module.ROLE_BINDING.binding_id
+        with mock.patch.object(module, "_write_request") as write:
+            module.plumbmate_chat("hello", _connection=7)
+            write.assert_not_called()
+        self.assertEqual(module.ROLE_BINDING.binding_id, binding_id)
+
     def test_chat_without_client_manager_is_a_normal_refusal(self):
         module = self.boot()
         lines = []
         with mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
             module.plumbmate_chat("hello", "there", _connection=7)
         self.assertTrue(any("active Sim not found" in line for line in lines))
+
+    def test_overlong_chat_is_refused_without_silent_truncation(self):
+        module = self.boot()
+        lines = []
+        with mock.patch.object(module, "_active_sim", return_value=object()), \
+                mock.patch.object(module, "_write_request") as write, \
+                mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            module.plumbmate_chat("가" * 1001, _connection=7)
+        write.assert_not_called()
+        self.assertTrue(any("1000" in line for line in lines))
 
     def test_unicode_path_does_not_shift_archive_boundary(self):
         module = self.boot()

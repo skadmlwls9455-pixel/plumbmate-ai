@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import PROTOCOL_VERSION, BridgePaths, ProtocolError, atomic_write_json
+from .turn_delivery import CAPABILITY
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -54,6 +55,7 @@ MAX_CONNECTIONS = 4
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 IDLE_TIMEOUT_SECONDS = 300.0
 _ACCEPT_POLL_SECONDS = 0.1
+DELIVERY_MIN_INTERVAL_SECONDS = 0.25
 
 # Transport-level allow list. It bounds what the socket will carry; it does not
 # claim any of these events is produced, trustworthy, or safe to act on.
@@ -64,6 +66,7 @@ ALLOWED_EVENT_KINDS = frozenset((
     "save_committed",
     "interaction_started",
     "chat_turn",
+    "turn_poll",
 ))
 
 
@@ -309,6 +312,7 @@ class EventSocketServer:
         handshake_timeout: float = HANDSHAKE_TIMEOUT_SECONDS,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         max_frame_bytes: int = MAX_FRAME_BYTES,
+        delivery_reader=None,
     ) -> None:
         _validate_token(token)
         if not _is_loopback(host):
@@ -319,6 +323,7 @@ class EventSocketServer:
         self._max_frame_bytes = max_frame_bytes
         self._handshake_timeout = handshake_timeout
         self._idle_timeout = idle_timeout
+        self._delivery_reader = delivery_reader
         self._slots = threading.Semaphore(max_connections)
         self._events: queue.Queue[BridgeEvent] = queue.Queue(maxsize=queue_size)
         self._stopping = threading.Event()
@@ -468,14 +473,20 @@ class EventSocketServer:
             stream.write_frame({
                 "protocol_version": PROTOCOL_VERSION, "kind": "challenge", "nonce": nonce,
             })
-            if not self._authenticate(stream.read_frame(deadline=deadline), nonce):
+            hello = stream.read_frame(deadline=deadline)
+            if not self._authenticate(hello, nonce):
                 self._count("failed_handshakes")
                 stream.write_frame({
                     "protocol_version": PROTOCOL_VERSION,
                     "kind": "error", "reason": "unauthorized",
                 })
                 return
-            stream.write_frame({"protocol_version": PROTOCOL_VERSION, "kind": "welcome"})
+            capabilities = hello.get("capabilities", [])
+            stream.delivery_enabled = (self._delivery_reader is not None
+                                       and isinstance(capabilities, list)
+                                       and CAPABILITY in capabilities)
+            stream.write_frame({"protocol_version": PROTOCOL_VERSION, "kind": "welcome",
+                                "capabilities": [CAPABILITY] if stream.delivery_enabled else []})
             connection.settimeout(self._idle_timeout)
             self._event_loop(stream, peer)
         except ProtocolError as exc:
@@ -494,6 +505,7 @@ class EventSocketServer:
             self._slots.release()
 
     def _event_loop(self, stream: _FrameStream, peer: str) -> None:
+        next_delivery_at = 0.0
         while not self._stopping.is_set():
             frame = stream.read_frame()
             try:
@@ -504,6 +516,27 @@ class EventSocketServer:
                     "protocol_version": PROTOCOL_VERSION, "kind": "error",
                     "event_id": frame.get("event_id"), "reason": str(exc),
                 })
+                continue
+            if frame["kind"] == "turn_poll":
+                # Read-only control traffic bypasses the gameplay event queue.
+                # Bound disk work per authenticated connection, without sleeping.
+                now = time.monotonic()
+                reason = "delivery_unavailable"
+                if getattr(stream, "delivery_enabled", False):
+                    reason = "delivery_rate_limited"
+                    if now >= next_delivery_at:
+                        next_delivery_at = now + DELIVERY_MIN_INTERVAL_SECONDS
+                        try:
+                            delivery = self._delivery_reader(frame.get("payload", {}))
+                            stream.write_frame({"protocol_version": PROTOCOL_VERSION,
+                                                "kind": "ack", "event_id": frame["event_id"],
+                                                "delivery": delivery})
+                            continue
+                        except (ProtocolError, OSError, ValueError):
+                            # Do not leak paths, payloads or provider errors.
+                            reason = "delivery_unavailable"
+                stream.write_frame({"protocol_version": PROTOCOL_VERSION, "kind": "error",
+                                    "event_id": frame["event_id"], "reason": reason})
                 continue
             event = BridgeEvent(
                 kind=frame["kind"],

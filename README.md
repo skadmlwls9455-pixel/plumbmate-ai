@@ -3,8 +3,8 @@
 **An AI companion that plays a life simulation beside you, not over you.**
 
 PlumbMate is an experimental, local-first bridge between The Sims 4 and an AI
-companion. The companion receives a deliberately small snapshot of the active
-Sim, chats with the player, and returns a structured, allow-listed gameplay
+companion. The companion receives a deliberately small snapshot of the explicitly
+chosen player and partner Sims, chats with the player, and returns a structured, allow-listed gameplay
 suggestion. The long-term goal is a “second player” experience: the AI explains
 what it wants to do, the player can approve it, and only then is the action
 queued for the companion Sim.
@@ -25,13 +25,36 @@ actions yet.
 
 ## MVP flow
 
-1. The game-side script writes a compact JSON request when the player runs
-   `plumbmate.chat <message>` in the cheat console.
-2. The local companion reads the request and asks a configured provider for a
+1. In this alpha, use `plumbmate.setup` to choose the player Sim and AI partner
+   separately from the same household. At least two Sims are needed; the mod
+   never creates one. Roles reset across zone/household replacement and restart.
+2. Run `plumbmate.chat` with no arguments to open the experimental native input
+   dialog. It names the recipient; only the Send button submits. The developer
+   console form `plumbmate.chat <message>` remains available through the same
+   validation/send path.
+3. The local companion validates both roles before reserving an attempt, then asks a configured provider for a
    short Korean reply plus one structured action suggestion.
-3. The response is written back to the local bridge directory.
-4. `plumbmate.read` displays the response matching the last submitted request,
-   or its processing/failure/session-limit status. It never reads another turn's newest file.
+4. The response is written back to the local bridge directory.
+5. With a matching companion, the pending reply arrives on the notification wall
+   automatically (console fallback). `plumbmate.read` remains a manual recovery
+   command. Automatic failures are system notices, not character dialogue. Repeated reads,
+   responses from a previous role binding and replies older than 180 real seconds
+   are not displayed. It never reads another turn's newest file.
+
+The native picker, input dialog and notification adapters are **not yet
+live-verified** in this alpha. Use matching alpha.5 game/companion sources; older
+pre-role companions reject the added role fields. There is still no in-game
+menu entry. Automatic delivery is integration-tested, not yet live-verified.
+The mock provider explicitly labels
+connection-test replies; they are not autonomous AI play. See the
+[automatic delivery checkpoint](docs/CHECKPOINT_2026-09-09_DELIVERY_KO.md).
+
+Composer input is validated at 1000 Unicode code points without normalization
+or prefix truncation. Its native field ceiling is 2000 to allow for UTF-16 emoji
+counting; actual IME/paste behavior still needs live testing. A rejected or
+blocked draft is retained only in bounded local process memory for reopening
+in the same role/scene. Cancel, successful submission, or reopening in a changed
+scope clears it. Opening a dialog alone does not create a request or call a model.
 
 The current game-side adapter reports only a safe, small identity/household
 snapshot. Action execution is intentionally disabled in this first milestone.
@@ -64,6 +87,17 @@ rotating it requires `plumbmate.bridge.start` or a game restart.
 
 The socket is loopback-only and authenticated per connection with an HMAC
 answer to the server's nonce; the token itself is never sent.
+
+Automatic replies negotiate `turn_delivery_v1`. Only one pending turn is
+checked, at most once per real second, for up to 180 seconds after Send. This
+interval is a PlumbMate UX default, **not an EA requirement**. Reads happen in
+the companion; the game tick uses the nonblocking socket and memory only.
+Queries never generate dialogue or make API calls. Request/binding/scene IDs
+must match, and the original request must corroborate a reply's scope. A
+zone/household/role change or an off-lot participant cancels the automatic watch.
+Stopping the bridge cancels it too; a manual read remains available if the turn
+is still eligible. Old companions negotiate no capability and retain manual
+delivery. TTL hides late replies; it does not cancel or refund a model call.
 
 See [bridge reliability fixes and verification](docs/BRIDGE_FIXES_2026-09-05_KO.md)
 for the four reviewed defects, regression coverage, and remaining in-game checks.
@@ -182,7 +216,7 @@ Canonical contracts live in `companion/src/plumbmate/schemas/`. Run
 monetary limit; restarting starts a new allowance. Failed and over-limit turns
 are retained under `archive/rejected`, not automatically resubmitted.
 The context JSON is capped at **12,000 UTF-8 bytes**, preserving the live message
-and actor. Optional context is reduced as whole items. Console token totals are
+and both role identities. Optional context is reduced as whole items. Console token totals are
 heuristic context estimates, not provider usage or billed tokens.
 Event payload logging is opt-in via `--verbose-events`.
 
@@ -198,13 +232,44 @@ python -m plumbmate.cli serve \
   --bridge .plumbmate --provider openai
 ```
 
+Paid calls also require a reviewed billing policy. Without one, they fail closed
+before any HTTP request. Run `python -m plumbmate.cli budget configure --help`
+for explicit USD caps, exact model ID, price expiry and per-million input,
+cached-input, cache-write and output rates. The default caps are zero.
+Policy path defaults to `~/.config/plumbmate/billing.json`; override with
+`PLUMBMATE_BILLING_CONFIG`. Its sibling SQLite ledger is shared across bridge
+folders and must not be deleted to work around a spending block.
+
+`budget status` displays recorded/reserved amounts and unresolved request IDs.
+Uncertain calls block further spending across restarts. `budget reconcile` is an
+explicit, audited operator action after stopping active calls and checking the
+provider charge, not an automatic refund. These are developer CLI controls, not
+the finished novice-friendly setup UI. The rate-card figures exclude taxes,
+exchange rates, other apps, and unexpected provider pricing changes.
+
 The model is intentionally not hard-coded. This avoids silently switching cost
 or behavior when model availability changes. Requests use `store: false`.
 Persistent RP memory restoration is currently **disabled** until save-scope
 receipts are connected; model-generated memory patches are not stored as facts.
-Retrieval, model routing, actual usage accounting, and daily currency limits are
-future work, not completed features. See [current architecture](docs/ARCHITECTURE.md)
+Retrieval, model routing, persistent role/profile settings and a console-free
+chat workflow remain future work. The current role picker and composer are
+session-only prototypes with live UI/IME verification outstanding.
+Usage accounting and daily/cumulative/per-request USD limits are
+implemented locally but have not been tested with a billable provider call.
+See [current architecture](docs/ARCHITECTURE.md)
 and [UX/context review](docs/UX_CONTEXT_REVIEW_2026-09-06_KO.md).
+
+For a non-destructive connection check (no model call):
+
+```bash
+python -m plumbmate.cli doctor --bridge .plumbmate --connect
+```
+
+The full implementation/verification gaps and next UX work are tracked in the
+[2026-09-07 checkpoint](docs/CHECKPOINT_2026-09-07_KO.md), followed by the
+[2026-09-08 role checkpoint](docs/CHECKPOINT_2026-09-08_ROLES_KO.md).
+The latest input-dialog work is in the
+[2026-09-09 composer checkpoint](docs/CHECKPOINT_2026-09-09_CHAT_KO.md).
 
 ## Build the game-side archive
 
@@ -235,6 +300,9 @@ local/mock mode, publish the exact transmitted schema, and never bundle keys.
 - [x] Deterministic state delta and token budget estimator
 - [x] Python 3.7-compatible game command prototype
 - [x] In-game script discovery and import smoke test
+- [x] Korean multiword mock chat/read round trip in the authorized current household (no save command)
+- [x] Local durable spending reservations and USD limits (synthetic billing tests)
+- [x] Non-destructive connection diagnosis CLI
 - [ ] Throwaway-household command round trip
 - [ ] Player approval UI
 - [ ] Allow-listed action execution

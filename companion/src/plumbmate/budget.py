@@ -48,11 +48,15 @@ def clamp_request(request: dict[str, Any], max_context_bytes: int = MAX_CONTEXT_
     """
     validate_request(request)
     result = copy.deepcopy(request)
+    protected = {int(value) for key, value in result.get("roles", {}).items()
+                 if key in ("player_sim_id", "partner_sim_id")}
     while len(canonical_json(result).encode("utf-8")) > max_context_bytes:
+        removable = [index for index, member in enumerate(result.get("household", []))
+                     if int(member["sim_id"]) not in protected]
         if result.get("memory_summary"):
             result["memory_summary"] = ""
-        elif result.get("household"):
-            result["household"].pop()
+        elif removable:
+            result["household"].pop(removable[-1])
         elif result.get("recent_events"):
             result["recent_events"].pop(0)
         else:

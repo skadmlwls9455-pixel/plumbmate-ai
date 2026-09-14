@@ -26,6 +26,8 @@ from .event_socket import (
 )
 from .protocol import BridgePaths, PROTOCOL_VERSION, ProtocolError, atomic_write_json, read_json
 from .providers import create_provider
+from . import billing_cli
+from .doctor import inspect_bridge
 
 
 def bridge_from(value: str) -> BridgePaths:
@@ -41,9 +43,10 @@ def make_demo_request(message: str) -> dict[str, object]:
         "player_message": message,
         "session_id": "portfolio-demo",
         "game": {"name": "The Sims 4", "adapter": "prototype"},
-        "actor": {"sim_id": 2, "name": "에이든", "age": "YOUNGADULT", "mood": "HAPPY",
+        "actor": {"sim_id": 2, "name": "플레이어 심", "age": "YOUNGADULT", "mood": "HAPPY",
                   "motives": {"hunger": -60, "energy": 20, "social": 40, "fun": -10, "hygiene": 60, "bladder": 30}},
-        "household": [{"sim_id": 1, "name": "플레이어 심"}, {"sim_id": 2, "name": "에이든"}],
+        "household": [{"sim_id": 1, "name": "AI 파트너"}, {"sim_id": 2, "name": "플레이어 심"}],
+        "roles": {"binding_id": uuid.uuid4().hex, "scene_id": uuid.uuid4().hex, "player_sim_id": 2, "partner_sim_id": 1},
         "recent_events": ["둘이 같은 집으로 이사했다", "사진 촬영용 의상을 골랐다"],
         "memory_summary": "서로 다정한 연인이고 함께 보내는 조용한 시간을 좋아한다.",
     }
@@ -71,20 +74,26 @@ def _process_turn(engine: CompanionEngine, *, fail_on_error: bool = False) -> Pa
               "(not provider usage or money)", flush=True)
     if result is not None:
         print("turn completed: " + result.name, flush=True)
+    ledger = getattr(engine.provider, "ledger", None)
+    if ledger is not None and engine.budget.attempts != before:
+        print(json.dumps(ledger.report(), ensure_ascii=False), flush=True)
     return result
 
 
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="plumbmate")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    billing_cli.register(subparsers)
 
     commands = (
         "init", "demo", "serve-once", "serve", "show-latest",
-        "token", "listen", "run", "mock-event", "memory-search", "memory-stats", "memory-admin",
+        "token", "listen", "run", "mock-event", "doctor", "memory-search", "memory-stats", "memory-admin",
     )
     for command in commands:
         sub = subparsers.add_parser(command)
         sub.add_argument("--bridge", required=True, help="Local bridge directory")
+        if command == "doctor":
+            sub.add_argument("--connect", action="store_true", help="Test authenticated loopback only; no model calls")
         if command in {"serve-once", "serve", "run"}:
             sub.add_argument("--provider", choices=("mock", "openai"), default="mock")
         if command == "demo":
@@ -131,7 +140,13 @@ def _main(argv: list[str] | None = None) -> int:
             sub.add_argument("--payload", default="{}", help="JSON object")
 
     args = parser.parse_args(argv)
+    if args.command == "budget":
+        return billing_cli.run(args)
     paths = bridge_from(args.bridge)
+    if args.command == "doctor":
+        report = inspect_bridge(paths, connect=args.connect)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["ok"] else 2
     paths.ensure()
 
     def open_memory() -> MemoryStore | None:
@@ -275,7 +290,9 @@ def _main(argv: list[str] | None = None) -> int:
                 print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         # The socket layer is loopback-only and refuses to start without a token.
         try:
-            server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port))
+            from .turn_delivery import TurnDeliveryReader
+            server = EventSocketServer(load_token(paths), port=configured_port(paths, args.port),
+                                       delivery_reader=TurnDeliveryReader(paths))
             server.start()
         except (OSError, SocketBridgeError) as exc:
             print(f"Listener not started: {exc}. Check the token/configuration and port owner; "

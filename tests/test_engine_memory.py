@@ -50,6 +50,7 @@ class EngineMemoryTests(unittest.TestCase):
             "session_id": session,
             "actor": {"sim_id": 1, "name": "케이트"},
             "household": [{"sim_id": 1, "name": "케이트"}, {"sim_id": 2, "name": "에이든"}],
+            "roles": {"binding_id": "a" * 32, "scene_id": "b" * 32, "player_sim_id": 1, "partner_sim_id": 2},
             "recent_events": [],
             "memory_summary": "게임이 보낸 요약은 항상 버려진다",
         }
@@ -135,6 +136,8 @@ class RecallContractTests(unittest.TestCase):
             "protocol_version": PROTOCOL_VERSION, "request_id": uuid.uuid4().hex, "kind": "turn",
             "created_at": "2026-09-06T00:00:00+00:00", "player_message": "안녕",
             "session_id": "household-1", "actor": {"sim_id": 1, "name": "케이트"},
+            "household": [{"sim_id": 1, "name": "케이트"}, {"sim_id": 2, "name": "에이든"}],
+            "roles": {"binding_id": "a" * 32, "scene_id": "b" * 32, "player_sim_id": 1, "partner_sim_id": 2},
         }
         atomic_write_json(paths.requests / f"{turn['request_id']}.json", turn)
         self.assertIsNotNone(engine.process_one())
@@ -165,6 +168,8 @@ class DriveStateTests(unittest.TestCase):
             "player_message": "오늘 뭐 할까?",
             "session_id": "household-1",
             "actor": actor,
+            "household": [{"sim_id": actor["sim_id"], "name": actor["name"]}, {"sim_id": 2, "name": "에이든"}],
+            "roles": {"binding_id": "a" * 32, "scene_id": "b" * 32, "player_sim_id": actor["sim_id"], "partner_sim_id": 2},
         }
         atomic_write_json(self.paths.requests / f"{request['request_id']}.json", request)
         return request
