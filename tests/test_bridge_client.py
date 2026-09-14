@@ -442,5 +442,59 @@ class BackpressureInteropTests(InteropHarness):
         self.assertEqual(self.client.awaiting_ack, 0)
 
 
+
+class AdoptOutboxTests(unittest.TestCase):
+    """A replacement client takes over the old client's unsent events."""
+
+    def test_adopting_from_itself_is_a_no_op(self):
+        client = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(client.close)
+        client.queue_event("heartbeat", {})
+        self.assertEqual(client.adopt_outbox(client), 0)
+        self.assertEqual(client.queued, 1)
+
+    def test_unsent_events_move_to_the_replacement(self):
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        new = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(old.close)
+        self.addCleanup(new.close)
+        for index in range(3):
+            self.assertIsNotNone(old.queue_event("heartbeat", {"index": index}))
+        self.assertEqual(new.adopt_outbox(old), 3)
+        self.assertEqual(old.queued, 0)
+        self.assertEqual(new.queued, 3)
+
+    def test_overflow_stays_behind_and_is_counted(self):
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        new = bridge.BridgeClient(TOKEN, closed_port(), max_outbox=2)
+        self.addCleanup(old.close)
+        self.addCleanup(new.close)
+        for index in range(5):
+            old.queue_event("heartbeat", {"index": index})
+        self.assertEqual(new.adopt_outbox(old), 2)
+        self.assertEqual(old.queued, 3)
+        self.assertEqual(new.queued, 2)
+        self.assertEqual(new.stats["rejected_by_outbox"], 3)
+
+    def test_adopted_events_reach_the_server_in_order(self):
+        server = EventSocketServer(TOKEN, idle_timeout=60.0)
+        server.start()
+        self.addCleanup(server.stop)
+        old = bridge.BridgeClient(TOKEN, closed_port())
+        self.addCleanup(old.close)
+        ids = [old.queue_event("heartbeat", {"index": index}) for index in range(3)]
+        new = bridge.BridgeClient(
+            TOKEN, server.port, connect_timeout=30.0, handshake_timeout=30.0,
+        )
+        self.addCleanup(new.close)
+        self.assertEqual(new.adopt_outbox(old), 3)
+        self.assertTrue(
+            pump_until(new, lambda: new.stats["acked_events"] == 3),
+            "adopted events were never acked: {}".format(new.last_error),
+        )
+        received = [server.poll(timeout=15.0).event_id for _ in range(3)]
+        self.assertEqual(received, ids)
+
+
 if __name__ == "__main__":
     unittest.main()

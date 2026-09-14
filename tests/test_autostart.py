@@ -687,5 +687,127 @@ class AutostartTests(unittest.TestCase):
                 factory.assert_not_called()
 
 
+
+class SnapshotTests(AutostartTests):
+    """Motives/buffs in the request snapshot: guarded, optional, bounded."""
+
+    def _fake_sim(self, with_tracker=True):
+        info = types.SimpleNamespace(sim_id=42, full_name="Test Partner", age="ADULT", gender="X")
+        household = types.SimpleNamespace(id=42, sim_info_gen=lambda: iter([info]))
+        levels = {"motive_Hunger": -160.0, "motive_Energy": 20.0, "motive_Fun": 250.0}
+
+        class Statistic(object):
+            def __init__(self, value):
+                self.value = value
+
+            def get_value(self):
+                return self.value
+
+        tracker = types.SimpleNamespace(
+            get_statistic=lambda tuning: Statistic(levels[tuning.__name__]) if tuning.__name__ in levels else None
+        )
+        buffs = types.SimpleNamespace(get_active_buff_types=lambda: [
+            types.SimpleNamespace(__name__="buff_Hungry"), types.SimpleNamespace(__name__="buff_Hungry")])
+        sim = types.SimpleNamespace(
+            sim_info=info, household=household, get_mood=lambda: types.SimpleNamespace(__name__="Mood_Happy"),
+            Buffs=buffs,
+        )
+        if with_tracker:
+            sim.commodity_tracker = tracker
+        return sim
+
+    def _fake_statistic_manager(self):
+        tunings = {index: types.SimpleNamespace(__name__=name) for index, name in enumerate(
+            ("motive_Hunger", "motive_Energy", "motive_Social", "motive_Fun", "motive_Hygiene",
+             "motive_Bladder", "commodity_Unrelated"))}
+        return types.SimpleNamespace(types=tunings)
+
+    def test_snapshot_reports_motives_and_buffs_when_the_game_exposes_them(self):
+        module = self.boot()
+        manager = self._fake_statistic_manager()
+        with mock.patch.object(module.services, "get_instance_manager", create=True, return_value=manager), \
+                mock.patch.object(module, "_sims4_resources",
+                                  new=types.SimpleNamespace(Types=types.SimpleNamespace(STATISTIC="statistic"))):
+            module._MOTIVE_TYPES = None
+            actor, household = module._snapshot(self._fake_sim())
+        # Values outside the game's range are clamped to the contract's [-100, 100].
+        self.assertEqual(actor["motives"], {"hunger": -100.0, "energy": 20.0, "fun": 100.0})
+        self.assertEqual(actor["buffs"], ["buff_Hungry"])
+        self.assertEqual(actor["mood"], "Mood_Happy")
+        from plumbmate.contracts import validate_request
+        validate_request({
+            "protocol_version": "0.1", "request_id": "a" * 32, "kind": "turn",
+            "created_at": "now", "player_message": "hi", "session_id": "household-42",
+            "actor": actor, "household": household,
+        })
+
+    def test_motive_lookup_retries_after_an_early_failure_and_drops_nan(self):
+        module = self.boot()
+        resources = types.SimpleNamespace(Types=types.SimpleNamespace(STATISTIC="statistic"))
+        manager = self._fake_statistic_manager()
+        attempts = []
+
+        def get_manager(kind):
+            attempts.append(kind)
+            if len(attempts) == 1:
+                raise RuntimeError("manager not ready")
+            return manager
+
+        sim = self._fake_sim()
+        sim.commodity_tracker.get_statistic = lambda tuning: types.SimpleNamespace(
+            get_value=lambda: float("nan") if tuning.__name__ == "motive_Fun" else -60.0)
+        with mock.patch.object(module.services, "get_instance_manager", create=True, side_effect=get_manager), \
+                mock.patch.object(module, "_sims4_resources", new=resources):
+            module._MOTIVE_TYPES = None
+            first, _ = module._snapshot(sim)
+            second, _ = module._snapshot(sim)
+        self.assertNotIn("motives", first, "the first snapshot ran before the manager was ready")
+        self.assertEqual(len(attempts), 2, "an empty lookup must not be cached")
+        self.assertNotIn("fun", second["motives"], "NaN is dropped, not clamped to +100")
+        self.assertEqual(second["motives"]["hunger"], -60.0)
+
+    def test_ping_survives_a_raising_household_property(self):
+        module = self.boot()
+        calls = []
+        fake_client = types.SimpleNamespace(
+            queue_event=lambda kind, payload=None: calls.append((kind, payload)) or "event-1",
+            close=lambda: None,
+        )
+        module.TICK_DRIVER.attach(fake_client)
+
+        class Sim(object):
+            @property
+            def household(self):
+                raise RuntimeError("zone transition")
+
+        manager = types.SimpleNamespace(get=lambda connection: types.SimpleNamespace(active_sim=Sim()))
+        with mock.patch.object(module.services, "client_manager", return_value=manager), \
+                mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lambda line: None):
+            module.plumbmate_bridge_ping(_connection=7)
+        self.assertEqual(calls, [("heartbeat", {"source": "cheat_console", "session_id": "household-local"})])
+
+    def test_snapshot_without_statistic_manager_omits_motives_and_keeps_the_turn(self):
+        module = self.boot()
+        actor, _household = module._snapshot(self._fake_sim(with_tracker=False))
+        self.assertNotIn("motives", actor)
+        self.assertEqual(actor["name"], "Test Partner")
+
+    def test_ping_carries_the_household_session_id(self):
+        module = self.boot()
+        calls = []
+        fake_client = types.SimpleNamespace(
+            queue_event=lambda kind, payload=None: calls.append((kind, payload)) or "event-1",
+            close=lambda: None,
+        )
+        module.TICK_DRIVER.attach(fake_client)
+        manager = types.SimpleNamespace(get=lambda connection: types.SimpleNamespace(active_sim=self._fake_sim()))
+        lines = []
+        with mock.patch.object(module.services, "client_manager", return_value=manager), \
+                mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            module.plumbmate_bridge_ping(_connection=7)
+        self.assertEqual(calls, [("heartbeat", {"source": "cheat_console", "session_id": "household-42"})])
+        self.assertTrue(any("queued heartbeat" in line for line in lines))
+
+
 if __name__ == "__main__":
     unittest.main()

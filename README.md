@@ -102,6 +102,78 @@ delivery. TTL hides late replies; it does not cancel or refund a model call.
 See [bridge reliability fixes and verification](docs/BRIDGE_FIXES_2026-09-05_KO.md)
 for the four reviewed defects, regression coverage, and remaining in-game checks.
 
+## Memory (Phase 1 slice)
+
+The companion keeps a local SQLite memory (`state/memory.sqlite3`) of what
+passed through it: the player's lines, the companion's replies, adapter-reported
+`recent_events`, and socket events. Each row carries a provenance
+(`game_observed`, `bridge_observed`, `player_canon`, `ai_inferred`) and nothing
+is ever promoted or deleted by the store itself; `ai_inferred` rows are capped
+at confidence 0.9 by the schema.
+
+Recording is on by default (`--no-memory` turns it off). **Recall is opt-in**:
+`--recall` scores candidates with a rule-based formula (keyword coverage,
+entity overlap, importance, recency, open promises), picks at most six, packs
+them into `memory_summary` within the 12 KB context budget, and writes why each
+candidate was or was not chosen to `retrieval_log`. Rows are keyed by the
+request's `session_id`; save scope is not verified yet, which is why recall is
+not the default. Events without a session are stored for audit only and never
+recalled.
+
+```bash
+python -m plumbmate.cli run --bridge .plumbmate --provider mock --recall
+python -m plumbmate.cli memory-search --bridge .plumbmate --query "뒷마당 불"
+python -m plumbmate.cli memory-stats --bridge .plumbmate
+```
+
+No embeddings and no extra model calls are involved. Korean keywords are
+matched after rule-based particle stripping, so paraphrases and inflections
+can be missed; `retrieval_log` is the place to measure that before deciding on
+embeddings.
+
+### Lifecycle and reflection (Phase 3 slice)
+
+Nothing in the store is rewritten in place. `memory-admin` exposes the
+transitions: `edit` supersedes a row, `delete` hides it and `purge-deleted`
+is the only physical delete, `pin` exempts a row from decay, merging and
+archiving, and `promote --evidence-kind player_confirm --evidence "..."` is the
+one gate from `ai_inferred` to canon (logged in `canon_promotions`; without
+evidence it is refused). An inference that flips a canon fact on the same
+subject lands as `disputed` and is never recalled.
+
+Between turns the engine runs a rule-based batch (once the store has counted
+20 completed turns since the last run; the counter is persisted so short
+`serve-once` sessions add up; or `memory-admin maintain` by hand):
+
+- `consolidate` folds three or more identical observations within three days
+  into one "N회 반복" row; `archive` retires trivial rows nobody recalled in 90
+  days and unpromoted inferences after 60.
+- `summarize` writes one `relationship_summary` per sim pair from their shared
+  memories, at most weekly and only when new evidence arrived; the previous
+  summary is superseded. Fresh raw lines outrank it; it takes over as they
+  decay.
+- `reflect` writes one to three self-notes from what the session left
+  unresolved: a recall that found nothing, a promise open for three days, a
+  disputed guess. Notes carry trigger keywords and only surface when their
+  topic returns.
+
+Summaries and notes are `ai_inferred` (confidence 0.8 and 0.6), so they are
+labeled as the companion's own reading, rot on the inference TTL, and can
+become canon only through `promote`. The phrasing comes from a deterministic
+`RuleSummarizer`; a model-backed summarizer would implement the same two
+methods and cost one session attempt per call, and none exists yet.
+
+## Needs and mood (Phase 2a slice)
+
+The game snapshot may carry `actor.motives` (the six motive bars, -100 to 100)
+and `actor.buffs`. The companion turns them into one deterministic line,
+`drive_state` (e.g. `욕구: 배고픔 높음 | 기분: Mood_Happy`), using a homeostatic
+rule: urgency is the distance below a set point, nothing else. The line is part
+of the request contract, so the provider sees it; the mock provider's suggestion
+follows the most pressing need, which is how the behaviour is tested. Reading
+motives in-game uses the statistic manager and is guarded: a lookup that fails
+drops the field, never the turn, and is **not yet verified in the real game**.
+
 ## Repository layout
 
 ```text

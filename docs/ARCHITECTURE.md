@@ -25,6 +25,9 @@ Updated 2026-09-09 (local checkpoint). The master RFC map describes a target, no
 - `companion/turn_delivery.py`: read-only scope-checked file projection for the authenticated socket. Never enumerates history or invokes a provider. Original request corroborates dialogue scope; failures expose only fixed reason codes.
 - `companion/event_socket.py`: loopback listener and pure-Python companion workers. Settings/framing/server can be separated later; no game APIs are called by workers.
 - `companion/cli.py`: configuration, service loops, and human-readable progress. Attempt accounting is owned by the engine, not duplicated per command.
+- `companion/drives.py`: homeostatic urgency from `actor.motives` and the bounded `drive_state` line the engine adds to a request. Pure function; no model, no action decisions.
+- `companion/memory.py` + `memory_text.py`: SQLite memory store (provenance-tagged rows, rule-based recall with a per-turn `retrieval_log` and `retrieval_turns`, single tunable weight row, status-only lifecycle: merge, archive, supersede, dispute, evidence-gated canon promotion). Recording is default, recall is opt-in per session_id until save receipts exist. Never imported by game code.
+- `companion/reflection.py`: between-turns batch over the store (relationship summaries per sim pair, Reflexion self-notes from retrieval misses, open promises and disputed guesses). Output is always `ai_inferred`; the `Summarizer` protocol is where a model call would plug in, with a deterministic rule implementation as the only one today.
 
 ## Boundaries that must remain true
 
@@ -32,7 +35,7 @@ Updated 2026-09-09 (local checkpoint). The master RFC map describes a target, no
 2. Game ticks perform bounded nonblocking socket work, not file polling, model calls, or background EA API calls. Endpoint files are persistent configuration, not liveness signals.
 3. No field outside the request schema reaches a provider. Model output cannot override request identifiers or introduce executable commands. A syntactically valid action is still only a suggestion in this prototype.
 4. Final responses are validated *after* local transforms. Game reads match the specific request ID; global newest-response lookup is only a developer CLI tool.
-5. Unknown save scope means no persistent RP memory restoration. Model-generated patches are not promoted to observed facts. Existing session files are preserved but ignored.
+5. Unknown save scope means no persistent RP memory restoration by default. The memory store records under the request's `session_id`; feeding recalled rows back into a turn is an explicit `--recall` opt-in, labeled as unverified scope. Model-generated patches are not promoted to observed facts. Existing session files are preserved but ignored.
 6. API uncertainty does not trigger automatic retries during normal single-engine processing. Connection retries are independent from paid model retries.
 7. Sequential server lifecycle control: stop admissions before sweeping connections. Retain timed-out worker references and refuse restart while old workers survive.
 8. The selected Sim is not the AI identity. Require a matching role binding; reject missing/ambiguous roles before provider/attempt use. Role/zone replacement invalidates display of previous requests. These in-memory fences are NOT verified save lineage.
@@ -70,7 +73,7 @@ call already in progress is not cancelled/refunded by this display policy.
 ## Not implemented yet
 
 The console-free entry point, live-verified automatic conversation, autonomous NPC-like partner, durable partner/profile settings, observed event
-atomization, verified save/branch receipts, memory DB/retrieval, L0–L3 router,
+atomization, verified save/branch receipts, model-backed memory summarization, L0–L3 router,
 IC scheduler, and relationship features remain separate milestones. Pure
 save-lineage and state-delta helpers exist but are not proof of end-to-end use.
 

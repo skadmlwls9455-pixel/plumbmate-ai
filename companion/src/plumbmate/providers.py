@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .budget import TokenBudget, clamp_request, estimate_tokens
+from .drives import assess, dominant
 from .contracts import model_output_schema, validate_model_output
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_response
 from .pricing import SpendingBlocked, SpendingPolicy
@@ -20,6 +21,24 @@ from .dialogue import dialogue_context
 
 class Provider(Protocol):
     def respond(self, request: dict[str, Any]) -> dict[str, Any]: ...
+
+
+DRIVE_IDEAS = {
+    "hunger": "같이 뭐 좀 만들어 먹자",
+    "energy": "오늘은 일찍 쉬자",
+    "social": "같이 수다 떨면서 놀자",
+    "fun": "같이 게임하거나 춤추자",
+    "hygiene": "먼저 씻고 오자",
+    "bladder": "잠깐만, 화장실부터 다녀올게",
+}
+DEFAULT_IDEA = "둘이 사진을 찍고 조용한 저녁 데이트를 한다"
+
+
+def idea_for(request: dict[str, Any]) -> str:
+    """The mock's suggestion follows the most pressing motive, if any."""
+    actor = request.get("actor")
+    pressing = dominant(assess(actor.get("motives") if isinstance(actor, dict) else None))
+    return DRIVE_IDEAS[pressing[0]] if pressing else DEFAULT_IDEA
 
 
 @dataclass
@@ -40,7 +59,7 @@ class MockProvider:
                 "arguments": {
                     "target_sim_id": None,
                     "interaction": None,
-                    "idea": "둘이 사진을 찍고 조용한 저녁 데이트를 한다",
+                    "idea": idea_for(request),
                 },
                 "reason": "MVP에서는 플레이어 승인 전 행동을 자동 실행하지 않습니다.",
             },
@@ -93,7 +112,8 @@ class OpenAIResponsesProvider:
             "Roleplay ONLY the explicitly designated partner, never the player Sim. "
             "You are a warm Korean-speaking fictional companion. "
             "Reply briefly in Korean. Choose exactly one allow-listed action. Never invent a target "
-            "identifier. Prefer suggest_only when required identifiers are absent. The game will ask "
+            "identifier. Prefer suggest_only when required identifiers are absent. "
+            "If drive_state is present, let the companion's current needs and mood shape the suggestion and tone. The game will ask "
             "the player before any action executes. Return only the requested JSON schema."
         )
         body: dict[str, Any] = {

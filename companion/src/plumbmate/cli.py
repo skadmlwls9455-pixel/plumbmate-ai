@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .engine import CompanionEngine
+from .memory import MemoryStore
+from .reflection import maintain, reflect, refresh_relationship_summaries
 from .event_socket import (
     ALLOWED_EVENT_KINDS,
     BridgeClient,
@@ -40,7 +43,8 @@ def make_demo_request(message: str) -> dict[str, object]:
         "player_message": message,
         "session_id": "portfolio-demo",
         "game": {"name": "The Sims 4", "adapter": "prototype"},
-        "actor": {"sim_id": 2, "name": "플레이어 심", "age": "YOUNGADULT", "mood": "HAPPY"},
+        "actor": {"sim_id": 2, "name": "플레이어 심", "age": "YOUNGADULT", "mood": "HAPPY",
+                  "motives": {"hunger": -60, "energy": 20, "social": 40, "fun": -10, "hygiene": 60, "bladder": 30}},
         "household": [{"sim_id": 1, "name": "AI 파트너"}, {"sim_id": 2, "name": "플레이어 심"}],
         "roles": {"binding_id": uuid.uuid4().hex, "scene_id": uuid.uuid4().hex, "player_sim_id": 2, "partner_sim_id": 1},
         "recent_events": ["둘이 같은 집으로 이사했다", "사진 촬영용 의상을 골랐다"],
@@ -83,7 +87,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     commands = (
         "init", "demo", "serve-once", "serve", "show-latest",
-        "token", "listen", "run", "mock-event", "doctor",
+        "token", "listen", "run", "mock-event", "doctor", "memory-search", "memory-stats", "memory-admin",
     )
     for command in commands:
         sub = subparsers.add_parser(command)
@@ -107,6 +111,29 @@ def _main(argv: list[str] | None = None) -> int:
         if command in {"serve-once", "serve", "run"}:
             sub.add_argument("--max-turns", type=int, default=20,
                              help="Maximum model attempts this session; no silent automatic retries")
+            sub.add_argument("--recall", action="store_true",
+                             help="Feed retrieved memories into memory_summary (session-scoped, "
+                                  "save scope is NOT verified; off by default)")
+        if command in {"serve-once", "serve", "run", "listen", "memory-search", "memory-stats", "memory-admin"}:
+            sub.add_argument("--memory-db", default=None,
+                             help="SQLite path (default: <bridge>/state/memory.sqlite3)")
+        if command in {"serve-once", "serve", "run", "listen"}:
+            sub.add_argument("--no-memory", action="store_true",
+                             help="Do not record turns/events into the memory store")
+        if command == "memory-admin":
+            sub.add_argument("action", choices=(
+                "show", "pin", "unpin", "edit", "delete", "purge-deleted", "promote", "consolidate", "archive",
+                "summarize", "reflect", "maintain"))
+            sub.add_argument("--id", type=int, default=None, help="memory_id for show/pin/unpin/edit/delete/promote")
+            sub.add_argument("--summary", default=None, help="edit: replacement text (old row is superseded)")
+            sub.add_argument("--evidence-kind", choices=("player_confirm", "game_event"), default=None)
+            sub.add_argument("--evidence", default=None, help="promote: the confirmation text or game event id")
+            sub.add_argument("--session", default=None,
+                             help="consolidate/summarize/reflect/maintain: restrict to one session_id")
+        if command == "memory-search":
+            sub.add_argument("--query", required=True, help="Free text to score against stored memories")
+            sub.add_argument("--session", default=None, help="Restrict to one session_id")
+            sub.add_argument("--limit", type=int, default=10)
         if command == "mock-event":
             sub.add_argument("--port", type=int, required=True)
             sub.add_argument("--kind", choices=sorted(ALLOWED_EVENT_KINDS), default="heartbeat")
@@ -122,6 +149,90 @@ def _main(argv: list[str] | None = None) -> int:
         return 0 if report["ok"] else 2
     paths.ensure()
 
+    def open_memory() -> MemoryStore | None:
+        if getattr(args, "no_memory", False):
+            return None
+        chosen = getattr(args, "memory_db", None)
+        target = Path(chosen).expanduser() if chosen else (paths.state / "memory.sqlite3")
+        if args.command in {"memory-search", "memory-stats", "memory-admin"}:
+            return MemoryStore(target)  # a broken store is the whole point of these commands
+        try:
+            return MemoryStore(target)
+        except sqlite3.Error as exc:
+            # Memory never decides a turn's fate: serve without it.
+            print(f"memory: store unavailable ({exc}); recording and recall are OFF this run", flush=True)
+            return None
+
+    if args.command == "memory-stats":
+        with open_memory() as memory:
+            print(json.dumps(memory.stats(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "memory-admin":
+        needs_id = args.action in {"show", "pin", "unpin", "edit", "delete", "promote"}
+        if needs_id and args.id is None:
+            print("--id is required for " + args.action)
+            return 2
+        with open_memory() as memory:
+            try:
+                if args.action == "show":
+                    row = memory.get(args.id)
+                    if row is None:
+                        print("no such memory")
+                        return 1
+                    print(json.dumps(row, ensure_ascii=False, indent=2))
+                    for promotion in memory.promotions(args.id):
+                        print("promotion: " + json.dumps(promotion, ensure_ascii=False))
+                elif args.action in {"pin", "unpin"}:
+                    memory.pin(args.id, args.action == "pin")
+                    print(f"{args.action}: {args.id}")
+                elif args.action == "edit":
+                    if not args.summary:
+                        print("--summary is required for edit")
+                        return 2
+                    print(f"superseded {args.id} by {memory.edit(args.id, args.summary)}")
+                elif args.action == "delete":
+                    memory.soft_delete(args.id)
+                    print(f"deleted (soft): {args.id}; run purge-deleted to remove rows physically")
+                elif args.action == "purge-deleted":
+                    print(f"purged: {memory.purge_deleted()}")
+                elif args.action == "promote":
+                    if not (args.evidence_kind and args.evidence):
+                        print("--evidence-kind and --evidence are required for promote")
+                        return 2
+                    memory.promote_to_canon(args.id, args.evidence_kind, args.evidence)
+                    print(f"promoted to canon: {args.id}")
+                elif args.action == "consolidate":
+                    print(f"merged groups: {memory.consolidate(args.session)}")
+                elif args.action == "archive":
+                    print(f"archived: {memory.archive_stale()}")
+                elif args.action in {"summarize", "reflect"}:
+                    job = refresh_relationship_summaries if args.action == "summarize" else reflect
+                    sessions = [args.session] if args.session else memory.sessions()
+                    for scope in sessions:
+                        for memory_id in job(memory, scope):
+                            row = memory.get(memory_id) or {}
+                            print(f"{scope} #{memory_id}: {row.get('summary', '')}")
+                elif args.action == "maintain":
+                    print(json.dumps(maintain(memory, args.session), ensure_ascii=False))
+            except KeyError:
+                print("no such memory")
+                return 1
+            except ValueError as exc:
+                print("memory-admin: " + str(exc))
+                return 2
+        return 0
+    if args.command == "memory-search":
+        if args.limit < 1:
+            print("--limit must be positive")
+            return 2
+        with open_memory() as memory:
+            for item in memory.search(args.query, session_id=args.session, limit=args.limit):
+                print(json.dumps({"memory_id": item.memory_id, "score": item.score, "type": item.memory_type,
+                                  "provenance": item.provenance, "summary": item.summary,
+                                  "reason": item.reason, "breakdown": item.breakdown},
+                                 ensure_ascii=False), flush=True)
+        return 0
+
     if args.command == "init":
         print(paths.root)
         return 0
@@ -132,19 +243,31 @@ def _main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
     if args.command in {"serve-once", "serve"}:
-        engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
-        if args.command == "serve-once":
-            result = _process_turn(engine, fail_on_error=True)
-            if result is None:
-                print("no completed turn; check pending requests or turn status")
-            return 0
+        if args.max_turns < 1:
+            print("--max-turns must be positive")
+            return 2
+        provider = create_provider(args.provider)
+        memory = open_memory()
+        engine = CompanionEngine(paths, provider, max_attempts=args.max_turns,
+                                 memory=memory, recall=args.recall)
+        if engine.recall_enabled:
+            print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         try:
-            while True:
-                result = _process_turn(engine)
+            if args.command == "serve-once":
+                result = _process_turn(engine, fail_on_error=True)
                 if result is None:
-                    time.sleep(max(0.1, args.interval))
-        except KeyboardInterrupt:
-            return 0
+                    print("no completed turn; check pending requests or turn status")
+                return 0
+            try:
+                while True:
+                    result = _process_turn(engine)
+                    if result is None:
+                        time.sleep(max(0.1, args.interval))
+            except KeyboardInterrupt:
+                return 0
+        finally:
+            if memory is not None:
+                memory.close()
     if args.command == "token":
         target = token_path(paths)
         if args.rotate or not target.exists():
@@ -153,11 +276,18 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     if args.command in {"listen", "run"}:
         engine = None
+        provider = None
         if args.command == "run":
             if args.max_turns < 1:
                 print("--max-turns must be positive")
                 return 2
-            engine = CompanionEngine(paths, create_provider(args.provider), max_attempts=args.max_turns)
+            provider = create_provider(args.provider)
+        memory = open_memory()
+        if provider is not None:
+            engine = CompanionEngine(paths, provider, max_attempts=args.max_turns,
+                                     memory=memory, recall=args.recall)
+            if engine.recall_enabled:
+                print("memory recall ON (session-scoped; save scope unverified)", flush=True)
         # The socket layer is loopback-only and refuses to start without a token.
         try:
             from .turn_delivery import TurnDeliveryReader
@@ -184,6 +314,11 @@ def _main(argv: list[str] | None = None) -> int:
                     if event is None:
                         continue
                     seen += 1
+                    if memory is not None:
+                        try:
+                            memory.remember_event(event.kind, event.payload)
+                        except Exception as exc:
+                            print(f"memory: event not stored ({type(exc).__name__})", flush=True)
                     summary = {"kind": event.kind, "event_id": event.event_id, "received_at": event.received_at}
                     if args.verbose_events:
                         summary["payload"] = event.payload
@@ -192,6 +327,8 @@ def _main(argv: list[str] | None = None) -> int:
                 pass
         finally:
             server.stop()
+            if memory is not None:
+                memory.close()
             # Keep configuration: a later launch must reach the same endpoint
             # cached by the game, without disk polling on the engine thread.
         return 0
@@ -224,6 +361,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except json.JSONDecodeError:
         print("PlumbMate: input must be valid JSON.", flush=True)
+        return 2
+    except sqlite3.Error as exc:
+        print(f"PlumbMate: memory store unusable ({exc}); check --memory-db.", flush=True)
         return 2
 
 

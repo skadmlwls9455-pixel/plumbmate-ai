@@ -17,6 +17,12 @@ import uuid
 import services
 import sims4.commands
 try:
+    import sims4.resources as _sims4_resources
+    _RESOURCES_ERROR = None
+except Exception as _exc:  # the statistic manager is optional for a snapshot
+    _sims4_resources = None
+    _RESOURCES_ERROR = "{}: {}".format(type(_exc).__name__, _exc)
+try:
     import plumbmate_turn_bridge
 except Exception:
     plumbmate_turn_bridge = None
@@ -137,6 +143,83 @@ def _active_sim(connection):
         return None
 
 
+# Motive commodities by tuning name. Levels run -100 (crisis) to 100.
+# NOT_TESTED in-game yet: every lookup is guarded, and a snapshot without
+# motives is still a valid request, so a wrong name costs a field, not a turn.
+_MOTIVE_STATISTICS = (
+    ("hunger", "motive_Hunger"), ("energy", "motive_Energy"), ("social", "motive_Social"),
+    ("fun", "motive_Fun"), ("hygiene", "motive_Hygiene"), ("bladder", "motive_Bladder"),
+)
+_MOTIVE_TYPES = None
+
+
+def _motive_types():
+    """Resolve motive statistic tunings once they are available.
+
+    Only a non-empty result is cached: the manager may not be populated yet
+    when the first snapshot runs, and caching that miss would leave motives
+    absent for the whole game session.
+    """
+    global _MOTIVE_TYPES
+    if _MOTIVE_TYPES:
+        return _MOTIVE_TYPES
+    resolved = {}
+    try:
+        manager = services.get_instance_manager(_sims4_resources.Types.STATISTIC)
+        by_name = {}
+        for tuning in manager.types.values():
+            by_name[getattr(tuning, "__name__", "")] = tuning
+        for key, tuning_name in _MOTIVE_STATISTICS:
+            if tuning_name in by_name:
+                resolved[key] = by_name[tuning_name]
+    except Exception:
+        resolved = {}
+    if resolved:
+        _MOTIVE_TYPES = resolved
+    return resolved
+
+
+def _motives(sim):
+    """Current motive levels clamped to the contract's [-100, 100]."""
+    levels = {}
+    try:
+        tracker = getattr(sim, "commodity_tracker", None)
+        if tracker is None:
+            return levels
+        for key, tuning in _motive_types().items():
+            try:
+                statistic = tracker.get_statistic(tuning)
+                if statistic is None:
+                    continue
+                value = float(statistic.get_value())
+            except Exception:
+                continue
+            if value != value:  # NaN would clamp to +100 and read as no need
+                continue
+            levels[key] = max(-100.0, min(100.0, value))
+    except Exception:
+        return {}
+    return levels
+
+
+def _buffs(sim):
+    """Names of active buffs, bounded to what the contract allows."""
+    names = []
+    try:
+        component = getattr(sim, "Buffs", None) or getattr(getattr(sim, "sim_info", None), "Buffs", None)
+        if component is None:
+            return names
+        for buff_type in component.get_active_buff_types():
+            name = _safe_text(getattr(buff_type, "__name__", buff_type))[:60]
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= 12:
+                break
+    except Exception:
+        return []
+    return names
+
+
 def _snapshot(sim):
     sim_info = sim.sim_info
     actor = {
@@ -150,6 +233,12 @@ def _snapshot(sim):
         actor["mood"] = _safe_text(getattr(mood, "__name__", mood))[:80]
     except Exception:
         pass
+    motives = _motives(sim)
+    if motives:
+        actor["motives"] = motives
+    buffs = _buffs(sim)
+    if buffs:
+        actor["buffs"] = buffs
 
     household = []
     try:
@@ -358,6 +447,9 @@ def plumbmate_bridge_start(_connection=None):
         plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
         previous = TICK_DRIVER.detach()
         if previous is not None:
+            # Events queued but never sent carry no duplication risk; they
+            # follow the replacement instead of vanishing with the old client.
+            client.adopt_outbox(previous)
             previous.close()
         _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT = client, endpoint
         TICK_DRIVER.attach(client)
@@ -432,7 +524,17 @@ def plumbmate_bridge_ping(_connection=None):
     if not _bridge_available() or TICK_DRIVER.client is None:
         output("PlumbMate: no client bound. Run plumbmate.bridge.start.")
         return
-    event_id = TICK_DRIVER.client.queue_event("heartbeat", {"source": "cheat_console"})
+    payload = {"source": "cheat_console"}
+    sim = _active_sim(_connection)
+    if sim is not None:
+        # Audit metadata only: heartbeats are never stored as memories, and a
+        # household id cannot authorize cross-save memory reuse (see _write_request).
+        try:
+            household_id = getattr(getattr(sim, "household", None), "id", "local")
+        except Exception:  # properties can raise during zone/household transitions
+            household_id = "local"
+        payload["session_id"] = "household-{}".format(household_id)
+    event_id = TICK_DRIVER.client.queue_event("heartbeat", payload)
     output("queued heartbeat: {}".format(event_id or "outbox full"))
 
 

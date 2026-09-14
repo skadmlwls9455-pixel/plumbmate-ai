@@ -260,6 +260,26 @@ class BridgeClient(object):
             self._fail("{}: {}".format(type(exc).__name__, exc))
         return self.state
 
+    def adopt_outbox(self, other):
+        """Move another client's queued-but-unsent events into this outbox.
+
+        Used when a client is replaced (explicit restart): the old client's
+        in-flight events are lost by design (at-most-once), but events that
+        were never sent carry no duplication risk and would otherwise vanish
+        with the discarded object. Entries that do not fit stay on ``other``
+        and are counted as rejected here.
+        """
+        if other is self:
+            return 0
+        adopted = 0
+        while other._outbox and len(self._outbox) < self._max_outbox:
+            self._outbox.append(other._outbox.pop(0))
+            adopted += 1
+        if other._outbox:
+            self.stats["rejected_by_outbox"] += len(other._outbox)
+        self.stats["queued_events"] += adopted
+        return adopted
+
     def close(self):
         """Release the socket. Queued events are kept; in-flight ones are lost."""
         self._clear_delivery()
