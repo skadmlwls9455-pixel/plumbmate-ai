@@ -54,7 +54,8 @@ on macOS / TS4 1.127.41.1230 with alpha.5**, using a separate QA save and mock
 provider. This does not prove every IME, platform, or scene transition. Alpha.6
 adds clearer copy and a once-only, scope-checked timeout system notice. Use matching
 game/companion sources; older pre-role companions reject the added role fields.
-There is still no in-game menu entry.
+The installed alpha.8 still has no console-free menu entry; alpha.9's launcher
+is a built, uninstalled prototype, not a verified phone-menu integration.
 Alpha.7 adds the designated partner's native portrait to reply notifications;
 this was live-verified on the same Mac build with a different Sim selected.
 System notices do not automatically use a character portrait.
@@ -135,6 +136,9 @@ See [bridge reliability fixes and verification](docs/BRIDGE_FIXES_2026-09-05_KO.
 for the four reviewed defects, regression coverage, and remaining in-game checks.
 
 ## Repository layout
+
+Current implementation/integration priorities and the September 17 modularity
+checkpoint: [work plan](docs/WORK_PLAN_2026-09-17_KO.md).
 
 ```text
 companion/       Local provider bridge and CLI (Python 3.11+)

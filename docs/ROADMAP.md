@@ -1,49 +1,59 @@
-# Roadmap
+# Roadmap — implementation status, 2026-09-17
 
-## Milestone 0 — completed in this prototype
+This is an experimental dialogue bridge, not yet an autonomous second player.
+The master design is a target architecture, not an implemented-feature list.
+See [the current work plan](WORK_PLAN_2026-09-17_KO.md) for ordered acceptance gates.
 
-- Versioned filesystem protocol
-- Offline deterministic demo
-- Bounded OpenAI Responses adapter
-- Python 3.7-compatible TS4 command source
-- Game-runtime bytecode compiler and `.ts4script` build
-- Unit tests for validation, state deltas, and bridge processing
-- Script discovery/import smoke test on game patch `1.127.41.1230`
+## Implemented in the current development branch
 
-## Milestone 1 — safe in-game smoke test
+- Versioned contracts, bounded context, isolated request/reply processing.
+- Nonblocking authenticated loopback transport, reconnect and stop controls.
+- Explicit player/partner roles, native Korean composer and notification replies.
+- Portrait routing, duplicate/stale response suppression, pending/dismiss UI.
+- OpenAI adapter, durable spending reservations and bounded external worker IO.
+- Game Python 3.7 compiler, offline tests and native bytecode contract probes.
+- Alpha.9 launcher/control menu **prototype**, not installed/live-accepted.
+- Separate UI, role identity, game-scene adapter and current-conversation policy.
 
-1. [x] Install only `PlumbMate.ts4script` into a dedicated one-level-deep test
-   folder while the game is closed.
-2. [x] Confirm `PlumbMate` appears in the game's Script Mods list without a new
-   `lastException.txt` or crash report.
-3. [ ] Back up one throwaway save and load a new test household.
-4. [ ] Verify `plumbmate.status`, `plumbmate.chat`, and `plumbmate.read`.
-5. [ ] Inspect `lastException.txt` and remove the prototype immediately on error.
-6. [ ] Confirm the request contains only the documented fields.
+## Live verification already recorded
 
-No action execution is enabled in this milestone.
+On the QA Mac / game 1.127.41.1230, alpha.8 and earlier passed the native role
+picker, basic Korean input, designated partner portrait, automatic mock reply,
+manual duplicate suppression and dismiss → reconnect → fresh-message flow.
+These tests used a backed-up QA save, not paid providers. They do not certify
+every UI path, platform, game patch or third-party-mod combination.
+See [the recovery checkpoint](UX_RECOVERY_2026-09-12_KO.md).
 
-## Milestone 2 — player-approved second-Sim control
+## Next: console-free conversation
 
-- Add a stable companion-Sim assignment flow.
-- Resolve interactions from an audited catalogue of tuning IDs.
-- Offer three buttons: approve once, suggest another, and cancel.
-- Queue one social/self-care action only after approval.
-- Add cooldowns, stale-target checks, save/zone transition guards, and an
-  emergency global off switch.
+- Install a backed-up candidate only when the game is closed.
+- Confirm launcher construction and repeated client-side button activation.
+- Complete roles → compose → mock reply without console commands.
+- Check cancellation, off-lot Sims, transitions, duplicate clicks and notification deletion.
+- Phone/Sim-menu tuning is separate work; the launcher is not that integration.
 
-## Milestone 3 — companion experience
+## Next: memory integration, not duplicate implementation
 
-- Korean in-game notification UI and local chat window
-- Relationship memory and date-plan templates
-- Event-driven reactions to mood, milestones, and relationship changes
-- OpenAI, Gemini, and local-model provider adapters behind the same interface
-- Per-session cost cap and a visible token/price meter
+`claude/memory-slice` contains SQLite memory, bounded rule-based recall,
+maintenance/reflection and a needs adapter. It is **not merged into this branch
+or installed**. Review provenance, recording consent, migrations and isolation;
+the current per-turn session ID cannot support cross-turn recall unchanged.
+Start with explicitly scoped same-session conversation continuity. Save-spanning
+recall remains blocked until a verified save-lineage integration exists.
 
-## Milestone 4 — portfolio release
+## Next: observed events and one safe action
 
-- Public demo video and architecture case study
-- Threat model, privacy disclosure, and reproducible release checksums
-- Signed/notarized companion builds for macOS and Windows
-- Compatibility matrix for current game patches
-- Automated tests against recorded, non-personal protocol fixtures
+- Add one verified event adapter with actor/target provenance and bounded retention.
+- Add one allow-listed, player-approved action with completion/cancellation evidence.
+- Add stale-target, queue ownership, cooldown and emergency-off safeguards.
+- Only then expand to autonomous intents, survival arbitration and model routing.
+
+## Later: companion experience and distribution
+
+- Persona editing, broader provider support, relationship growth and milestones.
+- Ordinary-player installer/settings, visible spending controls and key storage UX.
+- Paid-provider final acceptance within a separately approved test budget.
+- Privacy/export/delete controls, retention and compatibility matrix.
+- Signed/notarized desktop distribution, demo and portfolio case study.
+
+Publishing development commits does not mean release approval or game certification.

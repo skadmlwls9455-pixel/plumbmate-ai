@@ -66,6 +66,8 @@ def build(output: Path, game_app: Path = DEFAULT_GAME_APP, *, diagnostic: bool =
             (source_root / "plumbmate_mod" / "chat_input.py", Path("plumbmate_chat_input.pyc")),
             (source_root / "plumbmate_mod" / "chat_ui.py", Path("plumbmate_chat_ui.pyc")),
             (source_root / "plumbmate_mod" / "control_ui.py", Path("plumbmate_control_ui.pyc")),
+            (source_root / "plumbmate_mod" / "scene_adapter.py", Path("plumbmate_scene_adapter.pyc")),
+            (source_root / "plumbmate_mod" / "conversation_state.py", Path("plumbmate_conversation_state.pyc")),
             (source_root / "plumbmate_mod" / "reply_delivery.py", Path("plumbmate_reply_delivery.pyc")),
         ])
 

@@ -147,3 +147,25 @@ native bytecode. Client-side persistence, subclass factory construction, and
 actual menu navigation are **not verified**. Native notification deletion is not
 overridden or undone automatically; `plumbmate.ui` remains a recovery entry until
 a permanent phone/Sim menu is implemented and tested. See the alpha.9 checkpoint.
+
+### September 17 modularity checkpoint
+
+`scene_adapter.py` owns read-only active-Sim resolution, bounded snapshots,
+household context and resolving the explicitly bound player/partner. It takes
+EA services as an argument and imports no game modules, UI, filesystem or network
+code. Calls must still run on the engine thread; dependency injection does not
+make EA objects thread-safe. It is the future integration point for reviewed
+needs/event adapters from the separate memory branch.
+
+`conversation_state.py` owns the five current-turn fields previously scattered
+as bootstrap globals, and the shared displayed/dismissed/expired eligibility
+policy. It has no I/O or game dependencies and retains no growing history.
+The bootstrap records a new turn only after request commit; marking a turn
+displayed or dismissed does not imply cancellation of processing or accounting.
+Role/scene validation and native presentation remain separate responsibilities.
+
+This is an incremental extraction, not a complete runtime rewrite. Commands
+still compose dependencies and own bridge startup/configuration and UI routing.
+Extracting those is deferred to avoid combining memory integration, transport
+lifecycle changes and UI redesign in the same regression surface. Existing
+command entry points and thin private adapter wrappers are retained for now.

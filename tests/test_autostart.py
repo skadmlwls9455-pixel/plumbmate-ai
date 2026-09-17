@@ -107,6 +107,8 @@ class AutostartTests(unittest.TestCase):
         """Import the boot module with stubs in place, as mod load would."""
         sys.modules.update(_install_game_stubs())
         sys.modules["zone"].Zone = self.zone_class
+        _load_root_module("plumbmate_scene_adapter", "scene_adapter.py")
+        _load_root_module("plumbmate_conversation_state", "conversation_state.py")
         _load_root_module("plumbmate_bridge_client", "bridge_client.py")
         _load_root_module("plumbmate_reply_delivery", "reply_delivery.py")
         _load_root_module("plumbmate_tick_driver", "tick_driver.py")
@@ -323,7 +325,7 @@ class AutostartTests(unittest.TestCase):
         module = self.boot()
         responses = self.state.parent / "responses"
         responses.mkdir(parents=True, exist_ok=True)
-        module._LAST_REQUEST_ID = "a" * 32
+        module.TURN_STATE.request_id = "a" * 32
         unrelated = {"protocol_version": "0.1", "request_id": "b" * 32,
                      "partner_message": "wrong turn", "action": {"name": "suggest_only"}}
         (responses / ("b" * 32 + ".json")).write_text(json.dumps(unrelated), encoding="utf-8")
@@ -489,7 +491,7 @@ class AutostartTests(unittest.TestCase):
                 mock.patch("os.stat", side_effect=AssertionError("tick must not stat files")):
             module.TICK_DRIVER.on_tick()
         launch.assert_called_once()
-        self.assertIsNone(module._LAST_REQUEST_ID)
+        self.assertIsNone(module.TURN_STATE.request_id)
 
     def test_control_menu_opens_composer_without_console_connection_or_send(self):
         module = self.boot()
@@ -500,7 +502,7 @@ class AutostartTests(unittest.TestCase):
         with mock.patch.object(module.CHAT_UI, "open") as composer:
             menu.call_args.args[2]()
         composer.assert_called_once()
-        self.assertIsNone(module._LAST_REQUEST_ID)
+        self.assertIsNone(module.TURN_STATE.request_id)
         self.assertFalse((self.mods_root / "PlumbMateBridge/requests").exists())
 
     def test_chat_double_submit_creates_only_one_request(self):
@@ -509,6 +511,37 @@ class AutostartTests(unittest.TestCase):
         module.plumbmate_chat("hello", _connection=7)
         module.plumbmate_chat("again", _connection=7)
         self.assertEqual(len(list((self.mods_root / "PlumbMateBridge/requests").glob("*.json"))), 1)
+
+    def test_failed_request_write_never_advances_conversation_state(self):
+        module = self.boot()
+        _, player, _ = self._ready_role_pair(module)
+        module._write_request(player, "first")
+        previous = dict(vars(module.TURN_STATE))
+        with mock.patch.object(module.plumbmate_turn_bridge, "write_request", side_effect=OSError("disk failure")):
+            with self.assertRaises(OSError):
+                module._write_request(player, "not committed")
+        self.assertEqual(vars(module.TURN_STATE), previous)
+
+    def test_missing_conversation_module_never_writes_a_request(self):
+        module = self.boot()
+        _, player, _ = self._ready_role_pair(module)
+        module.TURN_STATE = None
+        with mock.patch.object(module.plumbmate_turn_bridge, "write_request") as write:
+            with self.assertRaises(ValueError):
+                module._write_request(player, "must not send")
+        write.assert_not_called()
+
+    def test_missing_scene_adapter_preserves_stop_and_status_diagnostics(self):
+        module = self.boot()
+        module.plumbmate_scene_adapter = None
+        lines = []
+        with mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            module.plumbmate_chat("hello", _connection=7)
+            module.plumbmate_status(_connection=7)
+            module.plumbmate_bridge_stop(_connection=7)
+        self.assertTrue(any("active Sim not found" in line for line in lines))
+        self.assertTrue(any("bridge stopped" in line for line in lines))
+        self.assertIsNone(module.TURN_STATE.request_id)
 
     def test_pending_chat_opens_status_instead_of_another_composer(self):
         module = self.boot()
@@ -529,16 +562,16 @@ class AutostartTests(unittest.TestCase):
             module.plumbmate_chat(_connection=7)
         self.assertIn("기록을 읽지 못했어요", status.call_args.args[2])
         status.call_args.args[5]()
-        self.assertEqual(module._LAST_DISMISSED_ID, module._LAST_REQUEST_ID)
+        self.assertEqual(module.TURN_STATE.dismissed_id, module.TURN_STATE.request_id)
 
     def test_dismiss_suppresses_late_manual_and_automatic_reply_but_allows_new_send(self):
         module = self.boot()
         self._ready_role_pair(module)
         module.plumbmate_chat("first", _connection=7)
-        first = module._LAST_REQUEST_ID
+        first = module.TURN_STATE.request_id
         old_scope = dict(module.REPLY_DELIVERY.scope)
         module.plumbmate_dismiss(_connection=7)
-        self.assertEqual(module._LAST_DISMISSED_ID, first)
+        self.assertEqual(module.TURN_STATE.dismissed_id, first)
         self.assertEqual(module.REPLY_DELIVERY.state, "dismissed")
         with mock.patch.object(module, "_latest_response") as read, mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
             module.plumbmate_read(_connection=7)
@@ -547,7 +580,7 @@ class AutostartTests(unittest.TestCase):
         read.assert_not_called()
         notify.assert_not_called()
         module.plumbmate_chat("second", _connection=7)
-        self.assertNotEqual(module._LAST_REQUEST_ID, first)
+        self.assertNotEqual(module.TURN_STATE.request_id, first)
         self.assertIsNone(module._reply_ineligible_reason())
 
     def test_old_dismiss_callback_cannot_affect_new_request_or_zone(self):
@@ -585,7 +618,7 @@ class AutostartTests(unittest.TestCase):
             module.plumbmate_chat(_connection=7)
         notify.assert_called_once()
         compose.assert_not_called()
-        self.assertEqual(module._LAST_DISPLAYED_ID, module._LAST_REQUEST_ID)
+        self.assertEqual(module.TURN_STATE.displayed_id, module.TURN_STATE.request_id)
 
     def test_bare_chat_opens_composer_without_creating_request(self):
         module = self.boot()
@@ -674,7 +707,7 @@ class AutostartTests(unittest.TestCase):
                 for _ in range(100):
                     self.zone_class().update(0)
                 notify.assert_called_once()
-            self.assertEqual(module._LAST_DISPLAYED_ID, module._LAST_REQUEST_ID)
+            self.assertEqual(module.TURN_STATE.displayed_id, module.TURN_STATE.request_id)
             provider.respond.assert_called_once()
             self.assertEqual(server.drain(), [])
 
@@ -710,9 +743,9 @@ class AutostartTests(unittest.TestCase):
             elif case == "off_lot":
                 partner.sim_info.get_sim_instance = lambda: None
             elif case == "expired":
-                module._LAST_SENT_AT -= module.TURN_DISPLAY_TTL_SECONDS
+                module.TURN_STATE.sent_at -= module.TURN_DISPLAY_TTL_SECONDS
             else:
-                module._LAST_DISPLAYED_ID = module._LAST_REQUEST_ID
+                module.TURN_STATE.displayed_id = module.TURN_STATE.request_id
             with self.subTest(case=case), mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
                 module._on_reply_tick(client)
                 notify.assert_not_called()
@@ -723,7 +756,7 @@ class AutostartTests(unittest.TestCase):
         module = self.boot()
         self._ready_role_pair(module)
         module.plumbmate_chat("hello", _connection=7)
-        previous = module._LAST_REQUEST_ID
+        previous = module.TURN_STATE.request_id
         client = mock.Mock(supports_turn_delivery=True)
         client.take_turn_delivery.return_value = dict(module.REPLY_DELIVERY.scope,
                                                        phase="failed", reason_code="spending_blocked")
@@ -734,14 +767,14 @@ class AutostartTests(unittest.TestCase):
             self.assertIn("금액 한도", notify.call_args.args[2])
             self.assertNotIn("portrait", notify.call_args.kwargs)
         module.plumbmate_chat("new explicit request", _connection=7)
-        self.assertNotEqual(previous, module._LAST_REQUEST_ID)
+        self.assertNotEqual(previous, module.TURN_STATE.request_id)
 
     def test_expiry_notice_is_system_only_once_without_file_io_and_allows_new_send(self):
         module = self.boot()
         _, player, _ = self._ready_role_pair(module)
         module.plumbmate_chat("pending", _connection=7)
-        previous = module._LAST_REQUEST_ID
-        module._LAST_SENT_AT -= 180
+        previous = module.TURN_STATE.request_id
+        module.TURN_STATE.sent_at -= 180
         module.REPLY_DELIVERY._expires_at = 0
         with mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify, \
                 mock.patch("builtins.open", side_effect=AssertionError("tick file IO")):
@@ -752,7 +785,7 @@ class AutostartTests(unittest.TestCase):
             self.assertEqual(notify.call_args.args[1], "PlumbMate · 연결 안내")
             self.assertIn("별도 호출", notify.call_args.args[2])
         module.plumbmate_chat("new explicit request", _connection=7)
-        self.assertNotEqual(previous, module._LAST_REQUEST_ID)
+        self.assertNotEqual(previous, module.TURN_STATE.request_id)
 
     def test_expiry_notice_never_crosses_context_or_repeats_completed_turn(self):
         for case in ("zone", "roles", "off_lot", "new_turn", "displayed"):
@@ -767,9 +800,9 @@ class AutostartTests(unittest.TestCase):
             elif case == "off_lot":
                 partner.sim_info.get_sim_instance = lambda: None
             elif case == "new_turn":
-                module._LAST_REQUEST_ID = "f" * 32
+                module.TURN_STATE.request_id = "f" * 32
             else:
-                module._LAST_DISPLAYED_ID = module._LAST_REQUEST_ID
+                module.TURN_STATE.displayed_id = module.TURN_STATE.request_id
             with self.subTest(case=case), mock.patch.object(module.plumbmate_role_setup_ui, "notify") as notify:
                 module._on_reply_tick(None)
                 module._on_reply_tick(None)
@@ -796,7 +829,7 @@ class AutostartTests(unittest.TestCase):
             if case == "reassignment":
                 self._ready_role_pair(module)
             else:
-                module._LAST_SENT_AT -= module.TURN_DISPLAY_TTL_SECONDS
+                module.TURN_STATE.sent_at -= module.TURN_DISPLAY_TTL_SECONDS
             with self.subTest(case=case), mock.patch.object(module, "_latest_response") as read:
                 module.plumbmate_read(_connection=7)
                 read.assert_not_called()
