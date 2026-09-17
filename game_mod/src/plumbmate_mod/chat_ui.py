@@ -1,7 +1,7 @@
 """Native composer adapter, verified structurally on TS4 1.127.41.1230.
 
-No auto-send, model calls, timers or file polling. IME/display still need live
-testing. Tuned global defaults are never modified for this dialog.
+No auto-send, model calls, timers or file polling. Basic Korean IME/display
+passed live testing on that build. Tuned global defaults are never modified.
 """
 
 from types import SimpleNamespace
@@ -36,7 +36,7 @@ def _make_dialog(owner, partner_name, draft):
     return UiDialogTextInputOkCancel.TunableFactory(text_inputs=(INPUT_NAME,)).default(
         owner=owner, text_inputs=_InputFields(field),
         title=lambda *args, **kwargs: _text("PlumbMate · {}에게 말하기".format(partner_name)),
-        text=lambda *args, **kwargs: _text("전송을 누를 때만 동반 앱으로 보내요. 이 시험판의 답변 확인은 plumbmate.read예요."),
+        text=lambda *args, **kwargs: _text("전송을 누르면 동반 앱으로 보내요. 자동 수신 연결 중에는 답변이 알림 담벼락에 도착해요."),
         text_ok=lambda *args, **kwargs: _text("전송"),
         text_cancel=lambda *args, **kwargs: _text("취소"))
 
@@ -44,9 +44,56 @@ def _make_dialog(owner, partner_name, draft):
 class ChatUI(object):
     def __init__(self):
         self.composer = Composer()
+        self._status_generation = 0
+        self._receipt = None
+
+    def receipt(self, scope):
+        return self._receipt[1] if self._receipt is not None and self._receipt[0] == scope else ""
+
+    def show_status(self, owner, partner_name, message, scope, current_scope, dismiss, output):
+        """Explicit user-opened snapshot, not a modal shown on every game tick.
+
+        Only the affirmative button ends waiting. Closing/Escape is inert.
+        Identity is rechecked after the window has potentially stayed open.
+        """
+        from ui.ui_dialog import UiDialogOkCancel, ButtonType
+        self._status_generation += 1
+        generation = self._status_generation
+        dialog = UiDialogOkCancel.TunableFactory().default(
+            owner=owner,
+            title=lambda *args, **kwargs: _text("PlumbMate · {} 답변 상태".format(partner_name)),
+            text=lambda *args, **kwargs: _text(message),
+            text_ok=lambda *args, **kwargs: _text("기다리기 끝내기"),
+            text_cancel=lambda *args, **kwargs: _text("닫고 기다리기"))
+        consumed = False
+
+        def selected(result):
+            nonlocal consumed
+            if consumed or generation != self._status_generation:
+                return
+            consumed = True
+            try:
+                if result.response != ButtonType.DIALOG_RESPONSE_OK:
+                    return
+                if current_scope() != scope:
+                    return  # A stale window cannot dismiss a newer conversation.
+                message = dismiss()
+                try:
+                    notify(owner, "PlumbMate · 대화 상태", message)
+                except Exception:
+                    output(message)
+            except Exception:
+                try:
+                    output("대화 상태가 바뀌었어요. 대화창을 다시 열어 확인해 주세요. 재전송하지 않았어요.")
+                except Exception:
+                    pass
+        dialog.show_dialog(on_response=selected)
 
     def open(self, owner, partner_name, scope, current_scope, submit, output):
+        self._status_generation += 1  # Invalidate any previous status window.
         ticket = self.composer.begin(scope)
+        if self._receipt is not None and self._receipt[0] != scope:
+            self._receipt = None
         dialog = _make_dialog(owner, partner_name, self.composer.draft)
 
         def console(message):
@@ -80,7 +127,8 @@ class ChatUI(object):
                 # Shared with console input: role, pending-turn and write guards.
                 receipt = submit(message)
                 self.composer.sent(ticket)
-                report(receipt)
+                self._receipt = (scope, receipt)
+                console(receipt)  # Reopen the menu/status for receipt; no wall spam.
             except ValueError as exc:
                 if self.composer.is_current(ticket):
                     self.composer.cancel(ticket)
@@ -89,6 +137,6 @@ class ChatUI(object):
                 # Consume a malformed result too; no automatic retry or body echo.
                 if self.composer.is_current(ticket):
                     self.composer.cancel(ticket)
-                report("대화를 처리하지 못했어요. 자동 재시도하지 않아요. plumbmate.read로 전송 상태를 확인해 주세요.")
+                report("대화를 처리하지 못했어요. 자동 재시도하지 않아요. 대화창을 다시 열어 전송 상태를 확인해 주세요.")
 
         dialog.show_dialog(on_response=selected)

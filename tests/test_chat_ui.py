@@ -149,6 +149,8 @@ class ChatAdapterTests(unittest.TestCase):
         dialog = self.open()
         self.assertIs(dialog.owner, self.owner)
         self.assertIn("AI 파트너", dialog.title())
+        self.assertIn("알림 담벼락", dialog.text())
+        self.assertNotIn("plumbmate.read", dialog.text())
         self.assertEqual((dialog.text_ok(), dialog.text_cancel()), ("전송", "취소"))
         field = getattr(dialog.text_inputs, self.module.INPUT_NAME)
         self.assertEqual(dialog.text_inputs.items(), ((self.module.INPUT_NAME, field),))
@@ -164,14 +166,59 @@ class ChatAdapterTests(unittest.TestCase):
         self.respond(dialog, text)
         self.submit.assert_called_once_with(text)
         self.assertEqual(self.ui.composer.draft, "")
-        self.assertEqual(len(self.notices), 1)
-        self.assertIn("대화 상태", self.notices[0][1])
+        self.assertEqual(self.notices, [])
+        self.assertEqual(self.ui.receipt(self.scope), self.submit.return_value)
+        self.assertEqual(self.ui.receipt(("other", "scene")), "")
 
     def test_cancel_does_not_read_missing_response_fields_or_send(self):
         dialog = self.open()
         dialog.callback(types.SimpleNamespace(accepted=False))
         self.submit.assert_not_called()
         self.assertEqual(self.notices, [])
+
+    def status_dialog(self, current=None, dismiss=None):
+        dialog = mock.Mock()
+        native = types.ModuleType("ui.ui_dialog")
+        native.ButtonType = types.SimpleNamespace(DIALOG_RESPONSE_OK=1)
+        native.UiDialogOkCancel = mock.Mock()
+        native.UiDialogOkCancel.TunableFactory.return_value.default.return_value = dialog
+        with mock.patch.dict(sys.modules, {"ui.ui_dialog": native}):
+            self.ui.show_status(self.owner, "파트너", "대기 상태", self.scope,
+                                current or (lambda: self.scope), dismiss or self.submit, self.lines.append)
+        return dialog.show_dialog.call_args.kwargs["on_response"], native
+
+    def test_status_close_is_not_dismiss_and_affirmative_is_single_use(self):
+        for response in (0, -1, None):
+            callback, _ = self.status_dialog()
+            callback(types.SimpleNamespace(response=response))
+            self.submit.assert_not_called()
+        callback, native = self.status_dialog()
+        result = types.SimpleNamespace(response=1)
+        callback(result)
+        callback(result)
+        self.submit.assert_called_once_with()
+        fields = native.UiDialogOkCancel.TunableFactory.return_value.default.call_args.kwargs
+        self.assertEqual(fields["text_ok"](), "기다리기 끝내기")
+        self.assertEqual(fields["text_cancel"](), "닫고 기다리기")
+
+    def test_old_status_window_cannot_dismiss_new_window_or_changed_scope(self):
+        old, _ = self.status_dialog()
+        self.status_dialog()
+        old(types.SimpleNamespace(response=1))
+        changed, _ = self.status_dialog(current=lambda: ("new", "scene"))
+        changed(types.SimpleNamespace(response=1))
+        old, _ = self.status_dialog()
+        self.open()
+        old(types.SimpleNamespace(response=1))
+        self.submit.assert_not_called()
+
+    def test_status_notice_failure_does_not_repeat_dismiss(self):
+        callback, _ = self.status_dialog()
+        with mock.patch.object(self.module, "notify", side_effect=RuntimeError()):
+            callback(types.SimpleNamespace(response=1))
+            callback(types.SimpleNamespace(response=1))
+        self.submit.assert_called_once()
+        self.assertTrue(self.lines)
 
     def test_role_or_scene_change_rejects_old_window(self):
         dialog = self.open()
@@ -237,13 +284,14 @@ class ChatAdapterTests(unittest.TestCase):
         self.assertEqual(len(self.notices), 1)
         self.submit.assert_not_called()
 
-    def test_notify_failure_does_not_resend_or_keep_sent_draft(self):
+    def test_success_does_not_depend_on_notification_availability(self):
         dialog = self.open()
-        with mock.patch.object(self.module, "notify", side_effect=RuntimeError()):
+        with mock.patch.object(self.module, "notify", side_effect=RuntimeError()) as notify:
             self.respond(dialog, "hello")
+        notify.assert_not_called()
         self.submit.assert_called_once()
         self.assertEqual(self.ui.composer.draft, "")
-        self.assertTrue(any("콘솔" in line for line in self.lines))
+        self.assertIn(self.submit.return_value, self.lines)
 
     def test_both_feedback_channels_can_fail_without_escaping_callback(self):
         self.ui.open(self.owner, "partner", self.scope, lambda: self.scope,

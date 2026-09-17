@@ -1,7 +1,7 @@
 """Thin, optional EA UI adapter. Selection never creates Sims or changes saves.
 
-Picker/notification symbols were inspected on game 1.127.41.1230. Their actual
-display still needs a live capability test; failure leaves console controls.
+Basic picker/notification display was verified on game 1.127.41.1230.
+Portrait overrides use its inspected native icon path; no image files or API.
 """
 
 
@@ -10,22 +10,40 @@ def _text(value):
     return LocalizationHelperTuning.get_raw_text(str(value))
 
 
-def notify(owner, title, message):
+def notify(owner, title, message, portrait=None):
     from ui.ui_dialog_notification import UiDialogNotification
     dialog = UiDialogNotification.TunableFactory().default(
         owner=owner, title=lambda *args, **kwargs: _text(title),
         text=lambda *args, **kwargs: _text(message))
-    dialog.show_dialog()
+    display = {}
+    if portrait is not None:
+        try:
+            from distributor.shared_messages import IconInfoData
+            # Native build_icon_info_msg expects an icon-capable game object.
+            # Never substitute the currently selected Sim for a missing speaker.
+            icon_info = portrait.icon_info
+            if icon_info is not None and None not in icon_info:
+                display["icon_override"] = IconInfoData(obj_instance=portrait)
+        except Exception:
+            pass  # Text survives unavailable portraits; do not repeat show_dialog.
+    dialog.show_dialog(**display)
 
 
 class RoleSetupUI(object):
     def __init__(self):
         self._generation = 0
 
-    def open(self, environment, binding, output, name_of):
+    def open(self, environment, binding, output, name_of, on_complete=None):
         zone, household, members, owner = environment()
         if len(members) < 2:
-            output("현재 가족에는 심이 한 명뿐이에요. 다른 심을 준비한 뒤 다시 설정해 주세요. API는 호출하지 않았어요.")
+            message = ("현재 가족에 심이 한 명뿐이거나 없어요. 이 버전은 같은 가족의 서로 다른 두 심이 필요해요. "
+                       "플레이어 심과 AI가 맡을 심을 준비한 뒤 다시 열어 주세요. "
+                       "심을 자동으로 만들거나 API를 호출하지 않았어요.")
+            output(message)
+            try:
+                notify(owner, "PlumbMate · 역할 설정 안내", message)
+            except Exception:
+                pass
             return
         self._generation += 1
         generation = self._generation
@@ -56,7 +74,7 @@ class RoleSetupUI(object):
                     if not result.accepted:
                         return
                     if not valid():
-                        output("가족이나 장소가 바뀌었어요. plumbmate.setup으로 다시 설정해 주세요.")
+                        output("가족이나 장소가 바뀌었어요. 역할 선택창을 다시 열어 주세요.")
                         return
                     picks = result.get_result_tags()
                     if len(picks) != 1 or not any(picks[0] is member for member in options):
@@ -72,6 +90,9 @@ class RoleSetupUI(object):
                 binding.bind(zone, household, player, partner, members)
                 message = "플레이어: {} → AI 파트너: {}. 장소/가족 전환 후에는 다시 설정해 주세요.".format(name_of(player), name_of(partner))
                 output(message)
+                if on_complete is not None:
+                    on_complete()
+                    return
                 try:
                     notify(owner, "PlumbMate · 역할 설정", message)
                 except Exception:

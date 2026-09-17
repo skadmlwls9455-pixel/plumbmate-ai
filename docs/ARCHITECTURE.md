@@ -1,14 +1,16 @@
 # Architecture: implemented foundation vs target product
 
-Updated 2026-09-09 (local checkpoint). The master RFC map describes a target, not shipped behavior.
+Updated 2026-09-12 (local checkpoint). The master RFC map describes a target, not shipped behavior.
 
 ## Current responsibilities
 
 - `game_mod/commands.py`: EA snapshot queries, cheat registration/output, bridge startup configuration.
 - `game_mod/role_binding.py`: pure session-only player/partner binding, object/ID identity fences. No game APIs, persistence or transport.
-- `game_mod/role_setup_ui.py`: optional native two-step picker and notification adapter. No Sim creation or model calls; display remains live-unverified.
+- `game_mod/role_setup_ui.py`: optional native two-step picker and notification adapter. No Sim creation or model calls; basic display verified on the installed Mac build.
 - `game_mod/chat_input.py`: bounded Unicode validation and single-draft/single-use composer tickets, with role/scene fencing. No EA APIs or persistence.
 - `game_mod/chat_ui.py`: optional native text-input adapter and non-narrative submission feedback. Calls the same guarded send function as console chat; never retries or polls files.
+- `game_mod/chat_ui.py` also owns the user-opened status dialog: exact response-ID and single-use callback fences; closing is inert. Commands own turn identity/dismissal, not the UI adapter.
+- `companion/provider_worker.py`: short-lived spawn boundary around blocking HTTP; fixed 1 MiB result buffer, wall-clock deadlines, bounded cleanup. No EA modules, ledger writes, retry or remote cancellation claims. `provider_http.py` retains endpoint/body/redirect validation.
 - `game_mod/turn_bridge.py`: bounded file requests/responses and user-facing turn receipts. File functions run only on explicit commands/Send; a pure response validator is shared by both delivery paths.
 - `game_mod/reply_delivery.py`: one bounded active-turn watch, real-time throttle/expiry, stale-scope rejection, terminal callback claim. No EA APIs, filesystem, history or provider calls.
 - `game_mod/tick_driver.py`: hook ownership, suspension, bounded pump scheduling.
@@ -66,10 +68,20 @@ also rate-limits disk lookups to at most four per second per authenticated
 connection (maximum four connections). No whole-directory scans or growing
 context/history cache were added. Display expires at 180 real seconds; a paid
 call already in progress is not cancelled/refunded by this display policy.
+User dismissal uses a separate last-dismissed ID, not the delivered marker.
+Both manual and automatic display reject dismissed replies; only explicit Send
+creates a replacement request. A status window cannot dismiss a new request,
+different role, expired turn or a response already shown while the window was open.
+There is no backend queued-request cancellation yet: dismissal only ends display.
+
+Provider deadlines are independent of UI expiry: input count 30s, generation 60s,
+each including worker startup with up to 2s additional cleanup. A surviving worker
+blocks new worker creation. The parent owns billing and preserves uncertain
+reservations even after local worker termination. Normal mock mode spawns no worker.
 
 ## Not implemented yet
 
-The console-free entry point, live-verified automatic conversation, autonomous NPC-like partner, durable partner/profile settings, observed event
+The console-free entry point, actual-model RP quality, autonomous NPC-like partner, durable partner/profile settings, observed event
 atomization, verified save/branch receipts, memory DB/retrieval, L0–L3 router,
 IC scheduler, and relationship features remain separate milestones. Pure
 save-lineage and state-delta helpers exist but are not proof of end-to-end use.
@@ -95,12 +107,43 @@ notification adapter build is not installed/live-tested yet; see
 [the role checkpoint](CHECKPOINT_2026-09-08_ROLES_KO.md).
 The alpha.4 input adapter adds hash-pinned native message-method tests, not
 native display or IME proof; see [the composer checkpoint](CHECKPOINT_2026-09-09_CHAT_KO.md).
-Alpha.5 adds automatic socket-to-notification orchestration. Its build is now
-installed locally, after backing up the previous mod and Saves. The Mac lock
-blocked the live UI check; no family/save was changed. See
-[the automatic delivery checkpoint](CHECKPOINT_2026-09-09_DELIVERY_KO.md).
+Alpha.5 added automatic socket-to-notification orchestration. On September 10,
+the native role picker, basic Korean IME/paste, paused automatic delivery,
+manual duplicate suppression and empty composer cancellation were verified in
+a separate QA save. Previous manual saves were preserved; native autosave changed
+during the earlier QA household transition and its backup remains available.
+Alpha.6 adds concise input/receipt copy and one scope-checked expiry system
+notice. Neither expiry nor a transport retry authorizes another model call.
+Alpha.7 adds an explicit partner portrait override. On September 11 its native
+reply portrait, selected-Sim independence, Korean input and automatic/manual
+duplicate suppression passed the Mac QA-family smoke test. Expiry UI still needs
+its own live test; system notices do not impersonate the partner.
+See [the live checkpoint](LIVE_CHECKPOINT_2026-09-10_KO.md) for exact evidence
+and installation status; older checkpoint limitations are historical.
 
 Before a release: live-verified role UX, response/save-scope isolation,
 general durable request claiming (paid IDs are protected by the spending ledger),
 real-provider billing validation, disk retention, and an ordinary-player UI.
 Do not mask transport failures as invented character behavior.
+
+### Alpha.9 console-free UI prototype (not live-accepted)
+
+`control_ui.py` owns the notification entry and menu, separate from composer,
+role selection and transport. A five-real-second, memory-only lifecycle check
+runs before transport binding/pumping, including when no token/client exists.
+It owns at most one launcher; zone/household changes and stop/reload close only
+that owned dialog. Three failed show attempts per continuous scope bound failure
+work. UI exceptions cannot count as transport pump failures. No automatic modal,
+request, paid call or gameplay action is generated by this lifecycle.
+
+Role selection can continue into the composer after both selections complete;
+cancel is never mapped to role reassignment. Successful send receipts are held
+only in scoped, bounded in-memory composer state and exposed in the control menu,
+not emitted as another notification or included in the model prompt. Actual
+partner replies and actionable failures retain their existing wall paths.
+
+The reusable launcher's server-side response contract was checked against pinned
+native bytecode. Client-side persistence, subclass factory construction, and
+actual menu navigation are **not verified**. Native notification deletion is not
+overridden or undone automatically; `plumbmate.ui` remains a recovery entry until
+a permanent phone/Sim menu is implemented and tested. See the alpha.9 checkpoint.

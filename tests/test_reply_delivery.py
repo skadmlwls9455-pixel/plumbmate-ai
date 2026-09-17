@@ -13,6 +13,14 @@ spec.loader.exec_module(delivery)
 
 
 class ReplyWatchTests(unittest.TestCase):
+    def test_pending_text_does_not_invent_model_progress_or_eta(self):
+        waiting = delivery.pending_message(None, 2, False)
+        self.assertIn("처리 확인이 없어요", waiting)
+        self.assertNotIn("처리하고 있어요", waiting)
+        processing = delivery.pending_message({"phase": "processing"}, 999, True)
+        self.assertIn("약 180초", processing)
+        self.assertIn("과금 취소는 아니", processing)
+
     def setUp(self):
         self.clock = Clock()
         self.watch = delivery.ReplyDelivery(now=self.clock)
@@ -44,6 +52,28 @@ class ReplyWatchTests(unittest.TestCase):
         self.clock.advance(1)
         self.step()
         self.assertEqual(self.client.request_turn_delivery.call_count, 2)
+
+    def test_expiry_notice_claimed_once_without_polling_even_if_reentrant(self):
+        expired = mock.Mock()
+        expired.side_effect = lambda _: self.watch.advance(self.client, self.context, self.display, expired)
+        self.clock.advance(180)
+        for _ in range(100):
+            self.watch.advance(self.client, self.context, self.display, expired)
+        expired.assert_called_once_with(self.scope)
+        self.context.assert_not_called()
+        self.client.request_turn_delivery.assert_not_called()
+        self.display.assert_not_called()
+
+    def test_failed_expiry_notice_never_retries_or_blocks_new_turn(self):
+        expired = mock.Mock(side_effect=RuntimeError("UI unavailable"))
+        self.clock.advance(180)
+        for _ in range(100):
+            self.watch.advance(self.client, self.context, self.display, expired)
+        expired.assert_called_once()
+        self.assertEqual(self.watch.state, "expiry_notice_failed")
+        self.watch.start("d" * 32, "b" * 32, "c" * 32, 7, self.clock())
+        self.step()
+        self.client.request_turn_delivery.assert_called_once()
 
     def test_context_transition_cancels_even_while_offline(self):
         for mode in ("different_scope", "missing_sim"):

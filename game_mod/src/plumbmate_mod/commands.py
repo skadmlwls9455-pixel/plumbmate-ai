@@ -38,6 +38,10 @@ try:
     import plumbmate_reply_delivery
 except Exception:
     plumbmate_reply_delivery = None
+try:
+    import plumbmate_control_ui
+except Exception:
+    plumbmate_control_ui = None
 
 # The build publishes these as root-level modules, like the diagnostic probe.
 # A partial or stale install must degrade to the filesystem bridge, not break
@@ -65,7 +69,7 @@ except Exception as _exc:
 
 
 PROTOCOL_VERSION = "0.1"
-MOD_VERSION = "0.1.1-alpha.5"
+MOD_VERSION = "0.1.1-alpha.9"
 DEFAULT_BRIDGE_PORT = 47651
 AUTOSTART_DISABLE_FILE = "autostart-disabled"
 
@@ -80,12 +84,14 @@ AUTOSTART_STATE = "not_attempted"
 _LAST_REQUEST_ID = None
 _LAST_ROLE_BINDING = None
 _LAST_DISPLAYED_ID = None
+_LAST_DISMISSED_ID = None
 _LAST_SENT_AT = 0.0
 TURN_DISPLAY_TTL_SECONDS = 180.0
 ROLE_BINDING = plumbmate_role_binding.RoleBinding() if plumbmate_role_binding else None
 ROLE_SETUP = plumbmate_role_setup_ui.RoleSetupUI() if plumbmate_role_setup_ui else None
 CHAT_UI = plumbmate_chat_ui.ChatUI() if plumbmate_chat_ui else None
 REPLY_DELIVERY = plumbmate_reply_delivery.ReplyDelivery() if plumbmate_reply_delivery else None
+CONTROL_UI = plumbmate_control_ui.ControlUI() if plumbmate_control_ui else None
 
 
 def _mod_directory():
@@ -130,7 +136,10 @@ def _sim_name(sim_info):
 def _active_sim(connection):
     try:
         manager = services.client_manager()
-        client = manager.get(connection) if manager is not None else None
+        if manager is None:
+            return None
+        # Native button callbacks have no cheat-console connection argument.
+        client = manager.get_first_client() if connection is None else manager.get(connection)
         return getattr(client, "active_sim", None) if client is not None else None
     except Exception:
         # Main menu / household transitions have no usable active client.
@@ -454,12 +463,10 @@ def _submit_chat(message, connection, output):
         raise ValueError("대화 입력 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
     message = plumbmate_chat_input.validate_message(message)
     sim, partner = _bound_player(connection)
-    if (_LAST_REQUEST_ID is not None and _LAST_ROLE_BINDING == ROLE_BINDING.binding_id
-            and _LAST_DISPLAYED_ID != _LAST_REQUEST_ID
-            and time.monotonic() - _LAST_SENT_AT < TURN_DISPLAY_TTL_SECONDS):
+    if not _reply_ineligible_reason():
         status = plumbmate_turn_bridge.read_status(_bridge_directory(), _LAST_REQUEST_ID)
         if status is None or status["phase"] != "failed":
-            raise ValueError("앞서 보낸 대화가 있어요. plumbmate.read로 확인해 주세요. 중복 전송하지 않았어요.")
+            raise ValueError("앞서 보낸 대화가 있어요. 대화창을 다시 열면 상태 확인이나 기다리기 종료를 할 수 있어요. 중복 전송하지 않았어요.")
     target = _write_request(sim, message)
     if REPLY_DELIVERY is not None:
         REPLY_DELIVERY.start(_LAST_REQUEST_ID, ROLE_BINDING.binding_id,
@@ -468,7 +475,7 @@ def _submit_chat(message, connection, output):
         output("PlumbMate request queued: {}".format(os.path.basename(target)))
     except Exception:
         pass  # A failed console receipt must not turn a committed write into a retry.
-    return "{} → {} · 요청을 남겼어요. 자동 수신 연결이 있으면 알림 담벼락에 답변이 도착해요. 수동 확인: plumbmate.read".format(_sim_name(sim.sim_info), _sim_name(partner))
+    return "{} → {} · 전송 요청을 남겼어요. 답변은 알림 담벼락에서 확인해 주세요.".format(_sim_name(sim.sim_info), _sim_name(partner))
 
 
 def _chat_scope(connection):
@@ -479,10 +486,69 @@ def _chat_scope(connection):
 def _open_chat(connection, output):
     if CHAT_UI is None:
         raise ValueError("대화창 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
-    sim, partner = _bound_player(connection)
+    try:
+        sim, partner = _bound_player(connection)
+    except ValueError:
+        if ROLE_BINDING is not None and ROLE_BINDING.binding_id is None and ROLE_SETUP is not None:
+            _open_role_setup(connection, output, lambda: _open_chat(connection, output))
+            return  # Setup never submits the user's message or invents a partner.
+        raise
+    if not _reply_ineligible_reason():
+        unreadable = False
+        try:
+            response = _latest_response()
+            status = plumbmate_turn_bridge.read_status(_bridge_directory(), _LAST_REQUEST_ID)
+        except (ValueError, OSError):
+            # Corrupt receipts must not trap users outside the dismiss UI.
+            response, status, unreadable = None, None, True
+        if response is not None:
+            _show_response(response, partner, output)
+            return
+        if status is None or status["phase"] != "failed":
+            client = TICK_DRIVER.client if TICK_DRIVER else None
+            automatic = bool(client and getattr(client, "supports_turn_delivery", False)
+                             and REPLY_DELIVERY and REPLY_DELIVERY.scope)
+            scope = (_LAST_REQUEST_ID,) + _chat_scope(connection)
+            message = plumbmate_reply_delivery.pending_message(
+                status, time.monotonic() - _LAST_SENT_AT, automatic)
+            if unreadable:
+                message = "응답 기록을 읽지 못했어요. 전송 실패나 과금 취소가 확인된 것은 아니에요.\n\n" + message
+            CHAT_UI.show_status(sim.sim_info, _sim_name(partner), message, scope,
+                                lambda: _pending_scope(connection),
+                                lambda: _dismiss_reply(connection, scope), output)
+            return
+        # Preserve the failure reason before offering a fresh composer.
+        _receive_reply(dict(status), connection)
     CHAT_UI.open(sim.sim_info, _sim_name(partner), _chat_scope(connection),
                  lambda: _chat_scope(connection),
                  lambda message: _submit_chat(message, connection, output), output)
+
+
+def _pending_scope(connection):
+    scope = _chat_scope(connection)
+    if _reply_ineligible_reason():
+        raise ValueError("This turn is no longer pending")
+    return (_LAST_REQUEST_ID,) + scope
+
+
+def _dismiss_reply(connection, expected_scope):
+    global _LAST_DISMISSED_ID
+    if _pending_scope(connection) != expected_scope:
+        raise ValueError("Conversation changed")
+    _LAST_DISMISSED_ID = _LAST_REQUEST_ID
+    if REPLY_DELIVERY is not None:
+        REPLY_DELIVERY.stop("dismissed")
+    return ("기다리기를 끝냈어요. 이 답변은 나중에도 표시하지 않아요. "
+            "처리·과금 취소는 아니에요. 새로 말하려면 대화창을 다시 열어 주세요.")
+
+
+@sims4.commands.Command("plumbmate.dismiss", command_type=sims4.commands.CommandType.Live)
+def plumbmate_dismiss(_connection=None):
+    output = sims4.commands.CheatOutput(_connection)
+    try:
+        output(_dismiss_reply(_connection, _pending_scope(_connection)))
+    except Exception:
+        output("이 역할·장소에서 끝낼 대기가 없어요. 새 대화나 다른 심의 답변은 변경하지 않았어요.")
 
 
 @sims4.commands.Command("plumbmate.chat", command_type=sims4.commands.CommandType.Live)
@@ -530,6 +596,8 @@ def _reply_ineligible_reason():
         return "이 역할 설정에서 보낸 대화가 없어요. 이전 설정의 답변은 표시하지 않아요."
     if _LAST_DISPLAYED_ID == _LAST_REQUEST_ID:
         return "이미 표시한 답변이에요. 알림 담벼락 또는 콘솔에서 확인해 주세요."
+    if _LAST_DISMISSED_ID == _LAST_REQUEST_ID:
+        return "기다리기를 끝낸 답변은 표시하지 않아요. 새로 대화할 수 있어요."
     if time.monotonic() - _LAST_SENT_AT >= TURN_DISPLAY_TTL_SECONDS:
         return "보낸 지 오래된 답변은 표시하지 않아요. 필요하면 새로 대화해 주세요."
     return None
@@ -544,7 +612,8 @@ def _show_response(response, partner, output):
     global _LAST_DISPLAYED_ID
     response = plumbmate_turn_bridge.validate_response(response, _LAST_REQUEST_ID)
     try:
-        plumbmate_role_setup_ui.notify(partner, "PlumbMate · " + _sim_name(partner), response["partner_message"])
+        plumbmate_role_setup_ui.notify(partner, "PlumbMate · " + _sim_name(partner),
+                                      response["partner_message"], portrait=partner)
     except Exception:
         output(response["partner_message"])
         output("알림을 표시하지 못해 콘솔에 답변을 표시했어요.")
@@ -583,21 +652,86 @@ def _receive_reply(reply, connection):
         _LAST_DISPLAYED_ID = _LAST_REQUEST_ID
 
 
+def _on_reply_expired(scope, connection):
+    # Expiry is not a fictional rejection, a cancellation, or a refund. Never
+    # surface an old turn's notice in a new family, role binding, or scene.
+    sim, _ = _bound_player(connection)
+    if (scope != {"request_id": _LAST_REQUEST_ID,
+                  "binding_id": ROLE_BINDING.binding_id,
+                  "scene_id": ROLE_BINDING.scene_id}
+            or _LAST_DISPLAYED_ID == _LAST_REQUEST_ID
+            or _LAST_DISMISSED_ID == _LAST_REQUEST_ID):
+        return
+    message = ("답변 대기 시간이 끝났어요. 늦게 온 답변은 표시하지 않으며 자동 재전송하지 않아요. "
+               "동반 앱 상태를 확인해 주세요. 이미 시작된 모델 호출은 계속될 수 있고, 새 전송은 별도 호출이에요.")
+    try:
+        plumbmate_role_setup_ui.notify(sim.sim_info, "PlumbMate · 연결 안내", message)
+    except Exception:
+        sims4.commands.CheatOutput(connection)(message)
+
+
 def _on_reply_tick(client):
     if REPLY_DELIVERY is None or REPLY_DELIVERY.scope is None:
         return
     connection = REPLY_DELIVERY.connection
     REPLY_DELIVERY.advance(client, lambda: _reply_scope(connection),
-                            lambda reply: _receive_reply(reply, connection))
+                            lambda reply: _receive_reply(reply, connection),
+                            lambda scope: _on_reply_expired(scope, connection))
+
+
+def _open_role_setup(connection, output, on_complete=None):
+    if ROLE_SETUP is None or ROLE_BINDING is None:
+        raise ValueError("역할 선택 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
+    ROLE_SETUP.open(lambda: _role_environment(connection), ROLE_BINDING, output, _sim_name,
+                    on_complete=on_complete)
+
+
+def _open_control(connection=None):
+    if CONTROL_UI is None:
+        return
+    environment = lambda: _role_environment(connection)
+    owner = environment()[3]
+    console = sims4.commands.CheatOutput(connection)
+
+    def report(message):
+        try:
+            plumbmate_role_setup_ui.notify(owner, "PlumbMate · 안내", message)
+        except Exception:
+            sims4.commands.CheatOutput(connection)(message)
+
+    try:
+        player, partner = _bound_player(connection)
+        summary = "내가 맡을 심: {}\nAI가 맡을 심: {}".format(_sim_name(player.sim_info), _sim_name(partner))
+        if CHAT_UI is not None:
+            receipt = CHAT_UI.receipt(_chat_scope(connection))
+            if receipt:
+                summary += "\n\n" + receipt
+    except ValueError:
+        summary = "먼저 내가 맡을 심과 AI가 맡을 심을 골라 주세요. 같은 가족의 서로 다른 두 심이 필요해요."
+    summary += "\n\n답변은 알림 담벼락에 표시돼요. 대화 열기에서 작성하거나 기다리는 답변의 상태를 확인할 수 있어요."
+    CONTROL_UI.open(environment, summary, lambda: _open_chat(connection, console),
+                    lambda: _open_role_setup(connection, console, lambda: _open_chat(connection, console)), report)
+
+
+def _on_ui_tick():
+    if CONTROL_UI is not None:
+        CONTROL_UI.pulse(lambda: _role_environment(None), _open_control)
+
+
+@sims4.commands.Command("plumbmate.ui", command_type=sims4.commands.CommandType.Live)
+def plumbmate_ui(_connection=None):
+    """Diagnostic/recovery entry; normal launch is the native wall button."""
+    try:
+        _open_control(_connection)
+    except Exception:
+        sims4.commands.CheatOutput(_connection)("PlumbMate 창을 열 수 없어요. 가족을 불러온 뒤 다시 시도해 주세요.")
 
 
 @sims4.commands.Command("plumbmate.setup", command_type=sims4.commands.CommandType.Live)
 def plumbmate_setup(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
     try:
-        if ROLE_SETUP is None or ROLE_BINDING is None:
-            raise ValueError("역할 선택 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
-        ROLE_SETUP.open(lambda: _role_environment(_connection), ROLE_BINDING, output, _sim_name)
+        _open_role_setup(_connection, output)
     except Exception:
         output("역할 선택창을 열 수 없어요. 가족을 불러왔는지 확인해 주세요. 이 게임 빌드의 UI 호환성 확인이 필요할 수 있어요.")
 
@@ -607,6 +741,8 @@ def plumbmate_setup(_connection=None):
 try:
     if TICK_DRIVER is not None:
         TICK_DRIVER.after_pump = _on_reply_tick
+        TICK_DRIVER.before_pump = _on_ui_tick
+        TICK_DRIVER.on_suspend = CONTROL_UI.close if CONTROL_UI else None
     start_autostart()
 except Exception as _exc:
     AUTOSTART_STATE = "autostart_raised: {}: {}".format(type(_exc).__name__, _exc)

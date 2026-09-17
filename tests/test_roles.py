@@ -27,6 +27,18 @@ ui_module = load_game_module("role_setup_ui")
 
 
 class RoleTests(unittest.TestCase):
+    def test_mock_confirms_transport_without_agreeing_or_creating_memories(self):
+        for text in ("싫어. 오늘은 혼자 있고 싶어", "안녕", "가" * 100):
+            with self.subTest(text=text):
+                response = MockProvider().respond(make_demo_request(text))
+                self.assertIn("실제 AI 대화가 아닌 수신 확인", response["partner_message"])
+                self.assertIn(text[:80], response["partner_message"])
+                self.assertNotIn("좋아.", response["partner_message"])
+                self.assertEqual(response["memory_patch"], [])
+                self.assertEqual(response["action"]["name"], "suggest_only")
+                if len(text) > 80:
+                    self.assertIn("…", response["partner_message"])
+
     def setUp(self):
         self.zone, self.household = object(), object()
         # Identical display names are intentionally allowed; IDs are distinct.
@@ -191,6 +203,18 @@ class SetupPickerTests(unittest.TestCase):
         self.choose(self.dialogs[1], self.partner)
         self.assertEqual(self.binding.wire()["partner_sim_id"], 2)
         self.notify.assert_called_once()
+
+    def test_selection_continues_once_to_chat_without_an_extra_notice(self):
+        completed = mock.Mock()
+        self.ui.open(lambda: (self.zone, self.household, self.members, self.player),
+                     self.binding, self.lines.append, lambda member: member.name, on_complete=completed)
+        self.choose(self.dialogs[0], self.player)
+        completed.assert_not_called()
+        self.choose(self.dialogs[1], self.partner)
+        self.choose(self.dialogs[1], self.partner)
+        completed.assert_called_once()
+        self.notify.assert_not_called()
+        self.assertEqual(self.binding.wire()["partner_sim_id"], 2)
 
     def test_repeated_callbacks_do_not_reopen_or_rebind(self):
         self.open()

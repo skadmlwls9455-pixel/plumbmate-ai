@@ -50,11 +50,16 @@ class TickDriver(object):
         bind_interval_seconds=DEFAULT_BIND_INTERVAL_SECONDS,
         now=None,
         after_pump=None,
+        before_pump=None,
+        on_suspend=None,
     ):
         if int(every_n_ticks) < 1:
             raise ValueError("every_n_ticks must be at least 1")
         self._client = client
         self.after_pump = after_pump
+        self.before_pump = before_pump
+        self.on_suspend = on_suspend
+        self.last_ui_error = None
         self._every = int(every_n_ticks)
         self._max_consecutive_errors = int(max_consecutive_errors)
         self._binder = binder
@@ -85,6 +90,11 @@ class TickDriver(object):
     def suspend(self):
         """Stop both binding and pumping, even if another mod retains our hook."""
         self._suspended = True
+        if self.on_suspend is not None:
+            try:
+                self.on_suspend()
+            except Exception as exc:
+                self.last_ui_error = type(exc).__name__
 
     def attach(self, client):
         """Bind a client and clear any previous disable."""
@@ -141,6 +151,14 @@ class TickDriver(object):
         if self._suspended:
             self.stats["skipped"] += 1
             return False
+        # UI lifecycle is independent of companion availability. Its failure
+        # must not disable the transport or accumulate pump-failure strikes.
+        before_pump = self.before_pump
+        if before_pump is not None:
+            try:
+                before_pump()
+            except Exception as exc:
+                self.last_ui_error = type(exc).__name__
         if self._binder is not None:
             self._try_bind()
         if not self.active:

@@ -56,6 +56,29 @@ class ExplodingClient(object):
 
 
 class DriverTests(unittest.TestCase):
+    def test_ui_lifecycle_runs_offline_but_not_after_stop(self):
+        seen = []
+        driver = driver_module.TickDriver(before_pump=lambda: seen.append("ui"),
+                                          on_suspend=lambda: seen.append("close"))
+        driver.on_tick()
+        driver.suspend()
+        driver.on_tick()
+        self.assertEqual(seen, ["ui", "close"])
+
+    def test_ui_failure_cannot_disable_or_delay_transport(self):
+        def broken():
+            raise ValueError("UI unavailable")
+        client = RecordingClient()
+        driver = driver_module.TickDriver(client, before_pump=broken, on_suspend=broken)
+        for _ in range(20):
+            self.assertTrue(driver.on_tick())
+        self.assertEqual(client.pumps, 20)
+        self.assertIsNone(driver.disabled_reason)
+        self.assertEqual(driver.stats["errors"], 0)
+        self.assertEqual(driver.last_ui_error, "ValueError")
+        driver.suspend()
+        self.assertFalse(driver.active)
+
     def test_idle_driver_does_not_pump(self):
         driver = driver_module.TickDriver()
         self.assertFalse(driver.active)
