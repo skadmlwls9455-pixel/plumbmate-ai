@@ -14,7 +14,7 @@ from .contracts import model_output_schema, validate_model_output
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_response
 from .pricing import SpendingBlocked, SpendingPolicy
 from .spend_ledger import SpendLedger
-from .provider_http import post_openai
+from .provider_worker import post_openai_bounded as post_openai
 from .dialogue import dialogue_context
 
 
@@ -34,17 +34,19 @@ class MockProvider:
         response = {
             "protocol_version": PROTOCOL_VERSION,
             "request_id": request["request_id"],
-            "partner_message": f"[연결 테스트·mock] {actor_name}: 좋아. ‘{message[:80]}’부터 같이 해보자.",
+            "partner_message": (f"[연결 테스트·mock]\n{actor_name} 앞으로 메시지가 전달됐어요.\n"
+                                f"‘{message[:80]}{'…' if len(message) > 80 else ''}’\n"
+                                "실제 AI 대화가 아닌 수신 확인이에요."),
             "action": {
                 "name": "suggest_only",
                 "arguments": {
                     "target_sim_id": None,
                     "interaction": None,
-                    "idea": "둘이 사진을 찍고 조용한 저녁 데이트를 한다",
+                    "idea": "연결 확인만 수행하며 게임 행동은 제안하거나 실행하지 않는다",
                 },
                 "reason": "MVP에서는 플레이어 승인 전 행동을 자동 실행하지 않습니다.",
             },
-            "memory_patch": [f"플레이어가 제안함: {message[:160]}"],
+            "memory_patch": [],
             "budget": {
                 "estimated_input_tokens": budget.estimated_input_tokens,
                 "max_output_tokens": budget.max_output_tokens,
