@@ -174,6 +174,37 @@ class ControlTests(unittest.TestCase):
         self.make.call_args.args[1]()
         self.activate.assert_called_once()
 
+    def test_home_only_describes_roles_and_receipt_until_user_selects(self):
+        chat, setup, notify, output = mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock()
+        with mock.patch.object(self.ui, "open") as opened:
+            self.ui.open_home(self.environment, lambda: ("Player", "Partner", "전송 요청을 남겼어요"),
+                              chat, setup, output, notify)
+        summary = opened.call_args.args[1]
+        self.assertIn("내가 맡을 심: Player", summary)
+        self.assertIn("AI가 맡을 심: Partner", summary)
+        self.assertIn("전송 요청", summary)
+        chat.assert_not_called()
+        setup.assert_not_called()
+        notify.assert_not_called()
+        opened.call_args.args[2]()
+        chat.assert_called_once_with()
+
+    def test_home_missing_roles_offers_setup_without_inventing_a_partner(self):
+        with mock.patch.object(self.ui, "open") as opened:
+            self.ui.open_home(self.environment, mock.Mock(side_effect=ValueError()),
+                              mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
+        self.assertIn("서로 다른 두 심", opened.call_args.args[1])
+        self.assertNotIn("에이든", opened.call_args.args[1])
+
+    def test_home_error_report_falls_back_to_supplied_output(self):
+        output, notify = mock.Mock(), mock.Mock(side_effect=RuntimeError())
+        with mock.patch.object(self.ui, "open") as opened:
+            self.ui.open_home(self.environment, lambda: ("P", "A", ""),
+                              mock.Mock(), mock.Mock(), output, notify)
+        opened.call_args.args[4]("안내")
+        notify.assert_called_once_with(self.owner, "PlumbMate · 안내", "안내")
+        output.assert_called_once_with("안내")
+
 
 if __name__ == "__main__":
     unittest.main()

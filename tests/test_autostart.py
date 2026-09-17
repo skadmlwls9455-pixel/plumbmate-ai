@@ -111,6 +111,7 @@ class AutostartTests(unittest.TestCase):
         _load_root_module("plumbmate_conversation_state", "conversation_state.py")
         _load_root_module("plumbmate_bridge_client", "bridge_client.py")
         _load_root_module("plumbmate_reply_delivery", "reply_delivery.py")
+        _load_root_module("plumbmate_reply_presenter", "reply_presenter.py")
         _load_root_module("plumbmate_tick_driver", "tick_driver.py")
         _load_root_module("plumbmate_turn_bridge", "turn_bridge.py")
         _load_root_module("plumbmate_role_binding", "role_binding.py")

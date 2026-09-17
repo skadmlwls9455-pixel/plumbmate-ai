@@ -69,6 +69,7 @@ def build(output: Path, game_app: Path = DEFAULT_GAME_APP, *, diagnostic: bool =
             (source_root / "plumbmate_mod" / "scene_adapter.py", Path("plumbmate_scene_adapter.pyc")),
             (source_root / "plumbmate_mod" / "conversation_state.py", Path("plumbmate_conversation_state.pyc")),
             (source_root / "plumbmate_mod" / "reply_delivery.py", Path("plumbmate_reply_delivery.pyc")),
+            (source_root / "plumbmate_mod" / "reply_presenter.py", Path("plumbmate_reply_presenter.pyc")),
         ])
 
     library, base_zip, core_zip = _game_paths(game_app)

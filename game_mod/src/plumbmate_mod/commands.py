@@ -45,6 +45,10 @@ try:
 except Exception:
     plumbmate_reply_delivery = None
 try:
+    import plumbmate_reply_presenter
+except Exception:
+    plumbmate_reply_presenter = None
+try:
     import plumbmate_control_ui
 except Exception:
     plumbmate_control_ui = None
@@ -549,21 +553,18 @@ def _failure_message(reason):
             else "응답을 처리하지 못했어요. 동반 앱 상태를 확인해 주세요.")
 
 
+def _reply_presenter():
+    if plumbmate_reply_presenter is None:
+        raise ValueError("답변 표시 모듈이 없어요. 모드 전체를 다시 설치해 주세요.")
+    return plumbmate_reply_presenter.ReplyPresenter(
+        TURN_STATE, REPLY_DELIVERY,
+        lambda *args, **kwargs: plumbmate_role_setup_ui.notify(*args, **kwargs),
+        lambda response, request_id: plumbmate_turn_bridge.validate_response(response, request_id),
+        _sim_name, _safe_text)
+
+
 def _show_response(response, partner, output):
-    response = plumbmate_turn_bridge.validate_response(response, TURN_STATE.request_id)
-    try:
-        plumbmate_role_setup_ui.notify(partner, "PlumbMate · " + _sim_name(partner),
-                                      response["partner_message"], portrait=partner)
-    except Exception:
-        output(response["partner_message"])
-        output("알림을 표시하지 못해 콘솔에 답변을 표시했어요.")
-    TURN_STATE.display()
-    if REPLY_DELIVERY is not None:
-        REPLY_DELIVERY.stop()
-    # Suggestions remain inert, regardless of which delivery channel was used.
-    output("Suggested action: {} | {}".format(response["action"]["name"],
-                                               _safe_text(response["action"].get("reason", ""))))
-    output("Automatic execution is disabled in prototype 0.1.")
+    _reply_presenter().show(response, partner, output)
 
 
 def _reply_scope(connection):
@@ -583,12 +584,7 @@ def _receive_reply(reply, connection):
         _show_response(reply.get("response"), partner, output)
     else:
         # System failure is not character dialogue or a fictional excuse.
-        message = _failure_message(reply.get("reason_code"))
-        try:
-            plumbmate_role_setup_ui.notify(sim.sim_info, "PlumbMate · 연결 안내", message)
-        except Exception:
-            output(message)
-        TURN_STATE.display()
+        _reply_presenter().failed(sim.sim_info, _failure_message(reply.get("reason_code")), output)
 
 
 def _on_reply_expired(scope, connection):
@@ -601,12 +597,7 @@ def _on_reply_expired(scope, connection):
             or TURN_STATE.displayed_id == TURN_STATE.request_id
             or TURN_STATE.dismissed_id == TURN_STATE.request_id):
         return
-    message = ("답변 대기 시간이 끝났어요. 늦게 온 답변은 표시하지 않으며 자동 재전송하지 않아요. "
-               "동반 앱 상태를 확인해 주세요. 이미 시작된 모델 호출은 계속될 수 있고, 새 전송은 별도 호출이에요.")
-    try:
-        plumbmate_role_setup_ui.notify(sim.sim_info, "PlumbMate · 연결 안내", message)
-    except Exception:
-        sims4.commands.CheatOutput(connection)(message)
+    _reply_presenter().expired(sim.sim_info, lambda message: sims4.commands.CheatOutput(connection)(message))
 
 
 def _on_reply_tick(client):
@@ -628,28 +619,18 @@ def _open_role_setup(connection, output, on_complete=None):
 def _open_control(connection=None):
     if CONTROL_UI is None:
         return
-    environment = lambda: _role_environment(connection)
-    owner = environment()[3]
     console = sims4.commands.CheatOutput(connection)
 
-    def report(message):
-        try:
-            plumbmate_role_setup_ui.notify(owner, "PlumbMate · 안내", message)
-        except Exception:
-            sims4.commands.CheatOutput(connection)(message)
-
-    try:
+    def describe_roles():
         player, partner = _bound_player(connection)
-        summary = "내가 맡을 심: {}\nAI가 맡을 심: {}".format(_sim_name(player.sim_info), _sim_name(partner))
-        if CHAT_UI is not None:
-            receipt = CHAT_UI.receipt(_chat_scope(connection))
-            if receipt:
-                summary += "\n\n" + receipt
-    except ValueError:
-        summary = "먼저 내가 맡을 심과 AI가 맡을 심을 골라 주세요. 같은 가족의 서로 다른 두 심이 필요해요."
-    summary += "\n\n답변은 알림 담벼락에 표시돼요. 대화 열기에서 작성하거나 기다리는 답변의 상태를 확인할 수 있어요."
-    CONTROL_UI.open(environment, summary, lambda: _open_chat(connection, console),
-                    lambda: _open_role_setup(connection, console, lambda: _open_chat(connection, console)), report)
+        receipt = CHAT_UI.receipt(_chat_scope(connection)) if CHAT_UI is not None else ""
+        return _sim_name(player.sim_info), _sim_name(partner), receipt
+
+    CONTROL_UI.open_home(
+        lambda: _role_environment(connection), describe_roles,
+        lambda: _open_chat(connection, console),
+        lambda: _open_role_setup(connection, console, lambda: _open_chat(connection, console)),
+        console, lambda *args: plumbmate_role_setup_ui.notify(*args))
 
 
 def _on_ui_tick():

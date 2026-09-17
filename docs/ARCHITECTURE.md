@@ -169,3 +169,18 @@ still compose dependencies and own bridge startup/configuration and UI routing.
 Extracting those is deferred to avoid combining memory integration, transport
 lifecycle changes and UI redesign in the same regression surface. Existing
 command entry points and thin private adapter wrappers are retained for now.
+
+### Presentation extraction (second September 17 checkpoint)
+
+`reply_presenter.py` now owns validated reply rendering, explicit partner
+portrait routing, console fallback, system failure/expiry notices and display
+acknowledgement. It receives state, watcher, notifier, validator and name/text
+formatting callbacks; it never imports the bootstrap,
+EA services, file bridge or provider. The commands layer still performs the
+role/scene, request and expiry fences **before** calling the presenter.
+
+`ControlUI.open_home` owns menu copy and fallback setup instructions. The caller
+supplies role names plus a scope-checked receipt and explicit chat/setup callbacks.
+Opening the menu does not invoke either callback or submit a request. Input and
+pending-status routing remains in the bootstrap for a later bounded extraction;
+bridge lifecycle is intentionally unchanged by this presentation refactor.

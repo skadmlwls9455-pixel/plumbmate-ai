@@ -142,3 +142,27 @@ class ControlUI(object):
                     pass
 
         dialog.show_dialog(on_response=selected)
+
+    def open_home(self, environment, describe_roles, chat, setup, output, notify):
+        """Compose the home view without owning role resolution or sending.
+
+        describe_roles returns display names and an already scope-checked receipt.
+        Only explicit menu response callbacks may enter chat or role selection.
+        """
+        owner = environment()[3]
+
+        def report(message):
+            try:
+                notify(owner, "PlumbMate · 안내", message)
+            except Exception:
+                output(message)
+
+        try:
+            player_name, partner_name, receipt = describe_roles()
+            summary = "내가 맡을 심: {}\nAI가 맡을 심: {}".format(player_name, partner_name)
+            if receipt:
+                summary += "\n\n" + receipt
+        except ValueError:
+            summary = "먼저 내가 맡을 심과 AI가 맡을 심을 골라 주세요. 같은 가족의 서로 다른 두 심이 필요해요."
+        summary += "\n\n답변은 알림 담벼락에 표시돼요. 대화 열기에서 작성하거나 기다리는 답변의 상태를 확인할 수 있어요."
+        self.open(environment, summary, chat, setup, report)
