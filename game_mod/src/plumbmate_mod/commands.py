@@ -71,6 +71,10 @@ except Exception as _exc:
     plumbmate_tick_driver = None
     _TICK_DRIVER_ERROR = "{}: {}".format(type(_exc).__name__, _exc)
 try:
+    import plumbmate_bridge_lifecycle
+except Exception:
+    plumbmate_bridge_lifecycle = None
+try:
     import zone
     _ZONE_ERROR = None
 except Exception as _exc:
@@ -88,9 +92,7 @@ TICK_DRIVER = plumbmate_tick_driver.TickDriver() if plumbmate_tick_driver else N
 
 # Configuration is read only at mod load or by an explicit start command.
 # The tick path never opens/stats files, creates directories, or spawns workers.
-_BOUND_ENDPOINT = None
-_BOOTSTRAP_CLIENT = None
-AUTOSTART_STATE = "not_attempted"
+BRIDGE_LIFECYCLE = None
 TURN_STATE = plumbmate_conversation_state.ConversationState() if plumbmate_conversation_state else None
 TURN_DISPLAY_TTL_SECONDS = 180.0
 ROLE_BINDING = plumbmate_role_binding.RoleBinding() if plumbmate_role_binding else None
@@ -220,6 +222,8 @@ def _bridge_reason():
         return False, "bridge_client import failed: {}".format(_BRIDGE_CLIENT_ERROR)
     if plumbmate_tick_driver is None or TICK_DRIVER is None:
         return False, "tick_driver import failed: {}".format(_TICK_DRIVER_ERROR)
+    if plumbmate_bridge_lifecycle is None:
+        return False, "bridge_lifecycle import failed; reinstall the complete archive"
     if zone is None:
         return False, "zone import failed: {}".format(_ZONE_ERROR)
     # A loaded wrapper does not prove the extension can make a socket.
@@ -249,110 +253,53 @@ def _autostart_disabled():
         return False
 
 
-def _autostart_binder(current):
-    """Memory-only binding. Socket state, not a file, determines liveness."""
-    global AUTOSTART_STATE
-    if _BOOTSTRAP_CLIENT is None:
-        return None
-    AUTOSTART_STATE = "bound" if current is not None and current.connected else "waiting_for_companion"
-    return _BOOTSTRAP_CLIENT if current is None else None
+def _install_bridge_hook():
+    return plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
 
 
-def start_autostart():
-    """Hook Zone.update at mod load and let the binder connect when it can.
+def _remove_bridge_hook():
+    return bool(zone is not None and plumbmate_tick_driver is not None
+                and plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update"))
 
-    Read configuration once here. A configured client retries the same numeric
-    loopback endpoint with backoff even when the companion starts later.
-    Creating/rotating the token or changing the port later requires an explicit
-    plumbmate.bridge.start (or a game restart), never filesystem polling.
-    Any failure here is reported through plumbmate.status rather than raised,
-    because an exception during mod import would take the whole mod down.
-    """
-    global AUTOSTART_STATE, _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT
-    if _autostart_disabled():
-        AUTOSTART_STATE = "disabled_by_file"
-        return False
-    available, reason = _bridge_reason()
-    if not available:
-        AUTOSTART_STATE = "unavailable: {}".format(reason)
-        return False
-    try:
-        _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT = _load_bootstrap()
-        AUTOSTART_STATE = "waiting_for_companion"
-    except FileNotFoundError:
-        AUTOSTART_STATE = "waiting_for_token"
-    except Exception:
-        AUTOSTART_STATE = "invalid_bridge_config"
-    try:
-        TICK_DRIVER.set_binder(_autostart_binder)
-        TICK_DRIVER.resume()
-        plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
-    except Exception as exc:
-        AUTOSTART_STATE = "hook_failed: {}: {}".format(type(exc).__name__, exc)
-        return False
-    return True
+
+def _autostart_state():
+    return BRIDGE_LIFECYCLE.state if BRIDGE_LIFECYCLE else "lifecycle_unavailable"
 
 
 @sims4.commands.Command("plumbmate.bridge.start", command_type=sims4.commands.CommandType.Live)
 def plumbmate_bridge_start(_connection=None):
-    """Bind a client now and hook Zone.update so every tick pumps it.
-
-    Autostart normally does this at mod load; this stays for a forced rebind.
-    """
-    global _BOUND_ENDPOINT, _BOOTSTRAP_CLIENT, AUTOSTART_STATE
+    """Explicit rebind; normal startup is owned by BridgeLifecycle."""
     output = sims4.commands.CheatOutput(_connection)
-    if not _bridge_available():
+    if BRIDGE_LIFECYCLE is None:
         output("PlumbMate: socket bridge unavailable in this build.")
         return
-    try:
-        client, endpoint = _load_bootstrap()
-    except FileNotFoundError:
-        output("PlumbMate: no bridge token. Run 'plumbmate token' in the companion.")
-        return
-    except Exception:
-        output("PlumbMate: invalid bridge configuration. Check the local token and loopback port.")
-        return
-    try:
-        # Install/reuse only our wrapper; do not modify another mod's chain.
-        plumbmate_tick_driver.install_tick_hook(zone.Zone, TICK_DRIVER, "update")
-        previous = TICK_DRIVER.detach()
-        if previous is not None:
-            previous.close()
-        _BOOTSTRAP_CLIENT, _BOUND_ENDPOINT = client, endpoint
-        TICK_DRIVER.attach(client)
-        TICK_DRIVER.set_binder(_autostart_binder)
-        TICK_DRIVER.resume()
-        AUTOSTART_STATE = "waiting_for_companion"
-    except Exception as exc:
-        output("PlumbMate bridge start failed: {}".format(_safe_text(exc)))
-        return
-    output("PlumbMate bridge started: {}:{} | tick hook installed".format(*endpoint))
+    result, detail = BRIDGE_LIFECYCLE.start()
+    messages = {
+        "unavailable": "PlumbMate: socket bridge unavailable in this build.",
+        "no_token": "PlumbMate: no bridge token. Run 'plumbmate token' in the companion.",
+        "invalid_config": "PlumbMate: invalid bridge configuration. Check the local token and loopback port.",
+    }
+    if result == "started":
+        output("PlumbMate bridge started: {}:{} | tick hook installed".format(*detail))
+    elif result == "start_failed":
+        output("PlumbMate bridge start failed: {}".format(detail))
+    else:
+        output(messages[result])
 
 
 @sims4.commands.Command("plumbmate.bridge.stop", command_type=sims4.commands.CommandType.Live)
 def plumbmate_bridge_stop(_connection=None):
     """Stop independently of socket availability or third-party wrapping."""
-    global _BOUND_ENDPOINT, _BOOTSTRAP_CLIENT, AUTOSTART_STATE
     output = sims4.commands.CheatOutput(_connection)
-    AUTOSTART_STATE = "stopped_by_command"
     if REPLY_DELIVERY is not None:
         REPLY_DELIVERY.stop("stopped")
-    _BOUND_ENDPOINT = None
-    bootstrap, _BOOTSTRAP_CLIENT = _BOOTSTRAP_CLIENT, None
-    try:
-        client = None
-        if TICK_DRIVER is not None:
-            TICK_DRIVER.suspend()
-            TICK_DRIVER.set_binder(None)
-            client = TICK_DRIVER.detach()
-        restored = bool(zone is not None and plumbmate_tick_driver is not None
-                        and plumbmate_tick_driver.remove_tick_hook(zone.Zone, "update"))
-        if client is not None:
-            client.close()
-        if bootstrap is not None and bootstrap is not client:
-            bootstrap.close()
-    except Exception as exc:
-        output("PlumbMate bridge stop failed: {}".format(_safe_text(exc)))
+    if BRIDGE_LIFECYCLE is None:
+        output("PlumbMate: lifecycle unavailable; no automatic bridge was started.")
+        return
+    restored = BRIDGE_LIFECYCLE.stop()
+    if BRIDGE_LIFECYCLE.cleanup_errors:
+        output("PlumbMate bridge stopped with cleanup errors: {}".format(
+            ", ".join(BRIDGE_LIFECYCLE.cleanup_errors)))
         return
     output("PlumbMate bridge stopped; {}. Use plumbmate.bridge.start to resume, "
            "or restart the game.".format(
@@ -367,7 +314,7 @@ def plumbmate_bridge_status(_connection=None):
         return
     client = TICK_DRIVER.client
     output("hook={} active={} autostart={}".format(
-        _hook_installed(), TICK_DRIVER.active, AUTOSTART_STATE))
+        _hook_installed(), TICK_DRIVER.active, _autostart_state()))
     output("driver={}".format(TICK_DRIVER.stats))
     if TICK_DRIVER.last_bind_error:
         output("last_bind_error={}".format(_safe_text(TICK_DRIVER.last_bind_error)))
@@ -404,7 +351,7 @@ def plumbmate_status(_connection=None):
     output("socket bridge: {} ({})".format(
         "available" if available else "unavailable", reason))
     output("tick hook: {}".format("installed" if _hook_installed() else "not installed"))
-    output("autostart: {}".format(AUTOSTART_STATE))
+    output("autostart: {}".format(_autostart_state()))
 
 
 def _submit_chat(message, connection, output):
@@ -663,6 +610,11 @@ try:
         TICK_DRIVER.after_pump = _on_reply_tick
         TICK_DRIVER.before_pump = _on_ui_tick
         TICK_DRIVER.on_suspend = CONTROL_UI.close if CONTROL_UI else None
-    start_autostart()
+    if plumbmate_bridge_lifecycle is not None:
+        BRIDGE_LIFECYCLE = plumbmate_bridge_lifecycle.BridgeLifecycle(
+            TICK_DRIVER, _load_bootstrap, _bridge_reason, _autostart_disabled,
+            _install_bridge_hook, _remove_bridge_hook)
+        BRIDGE_LIFECYCLE.autostart()
 except Exception as _exc:
-    AUTOSTART_STATE = "autostart_raised: {}: {}".format(type(_exc).__name__, _exc)
+    if BRIDGE_LIFECYCLE is not None:
+        BRIDGE_LIFECYCLE.state = "autostart_raised: {}".format(type(_exc).__name__)

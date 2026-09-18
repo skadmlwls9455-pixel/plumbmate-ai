@@ -184,3 +184,28 @@ supplies role names plus a scope-checked receipt and explicit chat/setup callbac
 Opening the menu does not invoke either callback or submit a request. Input and
 pending-status routing remains in the bootstrap for a later bounded extraction;
 bridge lifecycle is intentionally unchanged by this presentation refactor.
+
+### Bridge lifetime extraction (September 18)
+
+`bridge_lifecycle.py` now owns autostart, explicit rebind, memory-only binding,
+stop and the bootstrap client/endpoint/status previously stored as three command
+globals. It accepts the driver and narrow configuration/probe/hook callbacks.
+It does not import the bootstrap or EA modules, perform I/O itself, create a
+thread, or choose a new polling interval. Configuration callbacks are called
+only on load/explicit start; the binder never calls them. Commands retain path
+resolution, configuration adapters, command registration and diagnostic copy.
+
+The tick driver remains the only owner of wrapper-chain mechanics. Stop clears
+the binder's client reference before cleanup, suspends the driver, detaches,
+then removes only the owned hook. Distinct pending/attached clients are closed
+even when hook removal or another client's close fails. Cleanup errors expose
+exception types, not token/configuration text. Failed configuration or hook
+installation during manual replacement preserves the existing client; failed
+attach after replacement stops the new client rather than silently retrying.
+UI watcher cancellation remains at the command boundary; driver suspension still
+closes the owned launcher through its existing callback.
+
+This is structural work plus local failure-path hardening, not a newly verified
+game capability. The new archive still needs the native UI smoke gate. Same-save
+conversation continuity and observed-action memory are not implemented by this
+lifetime coordinator.

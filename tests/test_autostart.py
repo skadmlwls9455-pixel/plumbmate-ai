@@ -103,13 +103,17 @@ class AutostartTests(unittest.TestCase):
         sys.modules.clear()
         sys.modules.update(self.saved_modules)
 
-    def boot(self, *, bind_interval=0.0):
+    def boot(self, *, bind_interval=0.0, missing_lifecycle=False):
         """Import the boot module with stubs in place, as mod load would."""
         sys.modules.update(_install_game_stubs())
         sys.modules["zone"].Zone = self.zone_class
         _load_root_module("plumbmate_scene_adapter", "scene_adapter.py")
         _load_root_module("plumbmate_conversation_state", "conversation_state.py")
         _load_root_module("plumbmate_bridge_client", "bridge_client.py")
+        if missing_lifecycle:
+            sys.modules["plumbmate_bridge_lifecycle"] = None
+        else:
+            _load_root_module("plumbmate_bridge_lifecycle", "bridge_lifecycle.py")
         _load_root_module("plumbmate_reply_delivery", "reply_delivery.py")
         _load_root_module("plumbmate_reply_presenter", "reply_presenter.py")
         _load_root_module("plumbmate_tick_driver", "tick_driver.py")
@@ -125,10 +129,22 @@ class AutostartTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.addCleanup(self._unhook, module)
-        if module.TICK_DRIVER is not None:
+        if module.TICK_DRIVER is not None and module.BRIDGE_LIFECYCLE is not None:
             # Production waits 5s between attempts; tests should not.
-            module.TICK_DRIVER.set_binder(module._autostart_binder, bind_interval)
+            module.TICK_DRIVER.set_binder(module.BRIDGE_LIFECYCLE.bind, bind_interval)
         return module
+
+    def test_missing_lifecycle_module_keeps_diagnostics_and_stop_available(self):
+        module = self.boot(missing_lifecycle=True)
+        lines = []
+        with mock.patch.object(module.sims4.commands, "CheatOutput", return_value=lines.append):
+            module.plumbmate_status()
+            module.plumbmate_bridge_start()
+            module.plumbmate_bridge_stop()
+        self.assertIsNone(module.BRIDGE_LIFECYCLE)
+        self.assertFalse(module._hook_installed())
+        self.assertTrue(any("lifecycle_unavailable" in line for line in lines))
+        self.assertTrue(any("no automatic bridge was started" in line for line in lines))
 
     def _unhook(self, module):
         try:
@@ -167,7 +183,7 @@ class AutostartTests(unittest.TestCase):
     def test_import_alone_installs_the_hook(self):
         module = self.boot()
         self.assertTrue(module._hook_installed())
-        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_token")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "waiting_for_token")
         self.assertIsNone(module.TICK_DRIVER.client)
 
     def test_no_companion_means_ticks_stay_idle_and_harmless(self):
@@ -178,16 +194,16 @@ class AutostartTests(unittest.TestCase):
         self.assertIsNone(module.TICK_DRIVER.client)
         self.assertEqual(module.TICK_DRIVER.stats["pumps"], 0)
         self.assertEqual(module.TICK_DRIVER.stats["bind_errors"], 0)
-        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_token")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "waiting_for_token")
 
     def test_a_token_without_endpoint_uses_the_stable_default(self):
         self.write_token()
         module = self.boot()
-        client = module._autostart_binder(None)
+        client = module.BRIDGE_LIFECYCLE.bind(None)
         self.assertIsNotNone(client)
         self.assertEqual(client._port, module.DEFAULT_BRIDGE_PORT)
         self.assertFalse(client.connected)
-        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_companion")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "waiting_for_companion")
 
     def test_a_listener_without_a_token_reports_why_it_waits(self):
         server = EventSocketServer(TOKEN, idle_timeout=60.0)
@@ -199,7 +215,7 @@ class AutostartTests(unittest.TestCase):
         for tick in range(50):
             zone.update(tick)
         self.assertIsNone(module.TICK_DRIVER.client)
-        self.assertEqual(module.AUTOSTART_STATE, "waiting_for_token")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "waiting_for_token")
 
     def test_a_companion_started_after_the_game_is_picked_up(self):
         # Installation provisions credentials/configuration before game load.
@@ -224,7 +240,7 @@ class AutostartTests(unittest.TestCase):
             and module.TICK_DRIVER.client.connected
         ), "autostart never connected")
         zone.update(21)
-        self.assertEqual(module.AUTOSTART_STATE, "bound")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "bound")
 
         event_id = module.TICK_DRIVER.client.queue_event("heartbeat", {"source": "autostart"})
         self.assertTrue(self.tick_until(
@@ -301,7 +317,7 @@ class AutostartTests(unittest.TestCase):
         self.write_token()
         module = self.boot()
         client = mock.Mock(connected=False)
-        module._BOOTSTRAP_CLIENT = client
+        module.BRIDGE_LIFECYCLE.bootstrap_client = client
         zone = self.zone_class()
         with mock.patch("builtins.open", side_effect=AssertionError("tick file read")) as read, \
              mock.patch("os.path.exists", side_effect=AssertionError("tick stat")) as exists, \
@@ -320,7 +336,7 @@ class AutostartTests(unittest.TestCase):
         module = self.boot()
         self.zone_class().update(1)
         self.assertIsNone(module.TICK_DRIVER.client)
-        self.assertEqual(module.AUTOSTART_STATE, "invalid_bridge_config")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "invalid_bridge_config")
 
     def test_read_only_returns_the_exact_pending_response(self):
         module = self.boot()
@@ -362,7 +378,7 @@ class AutostartTests(unittest.TestCase):
         self.state.mkdir(parents=True, exist_ok=True)
         (self.state / "autostart-disabled").write_text("", encoding="utf-8")
         module = self.boot()
-        self.assertEqual(module.AUTOSTART_STATE, "disabled_by_file")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "disabled_by_file")
         self.assertFalse(module._hook_installed())
         self.assertIsNone(module.TICK_DRIVER.client)
 
@@ -381,7 +397,7 @@ class AutostartTests(unittest.TestCase):
         module.plumbmate_bridge_stop()
         self.assertFalse(module._hook_installed())
         self.assertIsNone(module.TICK_DRIVER.client)
-        self.assertEqual(module.AUTOSTART_STATE, "stopped_by_command")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "stopped_by_command")
         binds = module.TICK_DRIVER.stats["binds"]
         for tick in range(100):
             self.assertEqual(zone.update(tick), "engine-result")
@@ -412,7 +428,7 @@ class AutostartTests(unittest.TestCase):
         self.assertEqual(len(calls), 100)
         self.assertIsNone(module.TICK_DRIVER.client)
         self.assertEqual(module.TICK_DRIVER.stats["binds"], binds)
-        self.assertEqual(module.AUTOSTART_STATE, "stopped_by_command")
+        self.assertEqual(module.BRIDGE_LIFECYCLE.state, "stopped_by_command")
         # Explicit start is the only way back; it must not double-pump.
         with EventSocketServer(TOKEN) as server:
             self.write_endpoint(server.port)
