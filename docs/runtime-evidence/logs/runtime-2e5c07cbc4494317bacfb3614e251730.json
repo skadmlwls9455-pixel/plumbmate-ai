@@ -1,7 +1,7 @@
 {
   "created_at": "2026-09-05T05:47:24.813711Z",
   "executable": "/Applications/EA Games/The Sims 4.app/Contents/MacOS/The Sims 4",
-  "module_file": "/Users/kate/Documents/Electronic Arts/The Sims 4/Mods/00_PlumbMate_Test/PlumbMateDiagnostics.ts4script/plumbmate_diagnostics.pyc",
+  "module_file": "/Users/<user>/Documents/Electronic Arts/The Sims 4/Mods/00_PlumbMate_Test/PlumbMateDiagnostics.ts4script/plumbmate_diagnostics.pyc",
   "pid": 37337,
   "probe": "in_game_runtime",
   "revision": "runtime-2",
