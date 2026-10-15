@@ -30,6 +30,7 @@ import queue
 import secrets
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,12 +38,14 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import PROTOCOL_VERSION, BridgePaths, ProtocolError, atomic_write_json
+from .turn_delivery import CAPABILITY
 
 
 LOOPBACK_HOST = "127.0.0.1"
 TOKEN_ENVIRONMENT_VARIABLE = "PLUMBMATE_BRIDGE_TOKEN"
 TOKEN_FILENAME = "bridge-token"
 ENDPOINT_FILENAME = "bridge-endpoint.json"
+DEFAULT_BRIDGE_PORT = 47651
 
 MIN_TOKEN_CHARACTERS = 32
 NONCE_BYTES = 32
@@ -52,6 +55,7 @@ MAX_CONNECTIONS = 4
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 IDLE_TIMEOUT_SECONDS = 300.0
 _ACCEPT_POLL_SECONDS = 0.1
+DELIVERY_MIN_INTERVAL_SECONDS = 0.25
 
 # Transport-level allow list. It bounds what the socket will carry; it does not
 # claim any of these events is produced, trustworthy, or safe to act on.
@@ -62,6 +66,7 @@ ALLOWED_EVENT_KINDS = frozenset((
     "save_committed",
     "interaction_started",
     "chat_turn",
+    "turn_poll",
 ))
 
 
@@ -87,10 +92,10 @@ def endpoint_path(paths: BridgePaths) -> Path:
 
 
 def write_endpoint(paths: BridgePaths, host: str, port: int) -> Path:
-    """Publish where the listener is, so the game side need not guess a port.
+    """Persist connection configuration, retained across listener restarts.
 
     This is a convenience for discovery, never an authorization: a peer still
-    has to answer the challenge. The file carries no secret.
+    has to answer the challenge. File existence does NOT imply a live listener.
     """
     paths.ensure()
     target = endpoint_path(paths)
@@ -100,10 +105,34 @@ def write_endpoint(paths: BridgePaths, host: str, port: int) -> Path:
 
 
 def clear_endpoint(paths: BridgePaths) -> None:
+    """Explicit configuration reset only; never call on listener shutdown."""
     try:
         endpoint_path(paths).unlink()
     except OSError:
         pass
+
+
+def configured_port(paths: BridgePaths, requested: int | None = None) -> int:
+    """Reuse the last port; fail visibly on conflict instead of silently moving.
+
+    Explicit port 0 remains available for tests/manual discovery. The game must
+    explicitly reload configuration after a deliberate port or token change.
+    """
+    if requested is not None:
+        if not 0 <= requested <= 65535:
+            raise SocketBridgeError("Port must be between 0 and 65535")
+        return requested
+    try:
+        with endpoint_path(paths).open(encoding="utf-8") as handle:
+            endpoint = json.loads(handle.read(4097))
+        port = int(endpoint["port"])
+        if endpoint.get("host", LOOPBACK_HOST) != LOOPBACK_HOST or not 1 <= port <= 65535:
+            raise ValueError("Invalid loopback endpoint")
+        return port
+    except FileNotFoundError:
+        return DEFAULT_BRIDGE_PORT
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise SocketBridgeError("Invalid stored endpoint; choose an explicit --port") from exc
 
 
 def write_token(paths: BridgePaths, token: str | None = None) -> str:
@@ -184,6 +213,8 @@ class ServerStats:
     accepted_events: int = 0
     rejected_events: int = 0
     dropped_events: int = 0
+    acceptor_errors: int = 0
+    worker_errors: int = 0
 
 
 def mock_event(
@@ -208,7 +239,7 @@ def validate_event(value: dict[str, Any]) -> None:
         raise ProtocolError("Missing event fields: " + ", ".join(missing))
     if value["protocol_version"] != PROTOCOL_VERSION:
         raise ProtocolError("Unsupported event protocol")
-    if value["kind"] not in ALLOWED_EVENT_KINDS:
+    if not isinstance(value["kind"], str) or value["kind"] not in ALLOWED_EVENT_KINDS:
         raise ProtocolError("Event kind is not allow-listed")
     event_id = value["event_id"]
     if not isinstance(event_id, str) or not event_id.strip():
@@ -225,14 +256,21 @@ class _FrameStream:
         self._buffer = bytearray()
         self._max_bytes = max_bytes
 
-    def read_frame(self) -> dict[str, Any]:
+    def read_frame(self, *, deadline: float | None = None) -> dict[str, Any]:
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Handshake deadline exceeded")
+                self._connection.settimeout(remaining)
             index = self._buffer.find(b"\n")
             if index >= 0:
+                if index + 1 > self._max_bytes:
+                    raise ProtocolError("Frame exceeds the maximum size")
                 raw = bytes(self._buffer[:index])
                 del self._buffer[: index + 1]
                 return _decode_frame(raw)
-            if len(self._buffer) > self._max_bytes:
+            if len(self._buffer) >= self._max_bytes:
                 raise ProtocolError("Frame exceeds the maximum size")
             chunk = self._connection.recv(4096)
             if not chunk:
@@ -241,7 +279,7 @@ class _FrameStream:
 
     def write_frame(self, value: dict[str, Any]) -> None:
         data = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        if len(data) > self._max_bytes:
+        if len(data) + 1 > self._max_bytes:
             raise ProtocolError("Frame exceeds the maximum size")
         self._connection.sendall(data + b"\n")
 
@@ -274,6 +312,7 @@ class EventSocketServer:
         handshake_timeout: float = HANDSHAKE_TIMEOUT_SECONDS,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         max_frame_bytes: int = MAX_FRAME_BYTES,
+        delivery_reader=None,
     ) -> None:
         _validate_token(token)
         if not _is_loopback(host):
@@ -284,6 +323,7 @@ class EventSocketServer:
         self._max_frame_bytes = max_frame_bytes
         self._handshake_timeout = handshake_timeout
         self._idle_timeout = idle_timeout
+        self._delivery_reader = delivery_reader
         self._slots = threading.Semaphore(max_connections)
         self._events: queue.Queue[BridgeEvent] = queue.Queue(maxsize=queue_size)
         self._stopping = threading.Event()
@@ -307,23 +347,41 @@ class EventSocketServer:
     def start(self) -> None:
         if self._listener is not None:
             raise SocketBridgeError("Server is already started")
+        if ((self._acceptor is not None and self._acceptor.is_alive())
+                or any(worker.is_alive() for worker in self._workers)):
+            raise SocketBridgeError("Previous server threads are still stopping; retry stop first")
+        self._stopping.clear()
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self._host, self._requested_port))
             listener.listen(MAX_CONNECTIONS)
-        except OSError as exc:
+            listener.settimeout(_ACCEPT_POLL_SECONDS)
+            self._listener = listener
+            self._acceptor = threading.Thread(
+                target=self._accept_loop, name="plumbmate-accept", daemon=True,
+            )
+            self._acceptor.start()
+        except Exception as exc:
+            self._stopping.set()
+            self._listener = None
+            self._acceptor = None
             listener.close()
-            raise SocketBridgeError(f"Cannot bind {self._host}: {exc}") from exc
-        listener.settimeout(_ACCEPT_POLL_SECONDS)
-        self._listener = listener
-        self._acceptor = threading.Thread(
-            target=self._accept_loop, name="plumbmate-accept", daemon=True,
-        )
-        self._acceptor.start()
+            raise SocketBridgeError("Cannot start loopback listener") from exc
 
     def stop(self, timeout: float = 5.0) -> None:
+        # Lifecycle methods are called by one control thread, never a worker.
+        deadline = time.monotonic() + max(0.0, timeout)
         self._stopping.set()
+        # First stop admissions, then enumerate clients. Keep timed-out thread
+        # references so start() cannot revive a previous worker generation.
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            listener.close()
+        if self._acceptor is not None:
+            self._acceptor.join(max(0.0, deadline - time.monotonic()))
+            if not self._acceptor.is_alive():
+                self._acceptor = None
         with self._lock:
             live = list(self._connections)
         for connection in live:
@@ -332,15 +390,9 @@ class EventSocketServer:
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        listener, self._listener = self._listener, None
-        if listener is not None:
-            listener.close()
-        if self._acceptor is not None:
-            self._acceptor.join(timeout)
-            self._acceptor = None
         for worker in list(self._workers):
-            worker.join(timeout)
-        self._workers.clear()
+            worker.join(max(0.0, deadline - time.monotonic()))
+        self._workers = [worker for worker in self._workers if worker.is_alive()]
 
     def __enter__(self) -> EventSocketServer:
         self.start()
@@ -365,13 +417,22 @@ class EventSocketServer:
             events.append(event)
 
     def _accept_loop(self) -> None:
-        listener = self._listener
-        while not self._stopping.is_set() and listener is not None:
+        while not self._stopping.is_set():
+            listener = self._listener
+            if listener is None:
+                return
             try:
                 connection, address = listener.accept()
             except (socket.timeout, TimeoutError):
                 continue
             except OSError:
+                if self._stopping.is_set() or self._listener is None:
+                    return
+                self._count("acceptor_errors")
+                self._stopping.wait(_ACCEPT_POLL_SECONDS)
+                continue
+            if self._stopping.is_set():
+                connection.close()
                 return
             if not _is_loopback(address[0]):
                 # Cannot happen through a loopback bind; refused anyway.
@@ -386,31 +447,46 @@ class EventSocketServer:
             with self._lock:
                 self._connections.add(connection)
             self._workers = [thread for thread in self._workers if thread.is_alive()]
-            worker = threading.Thread(
-                target=self._serve_connection,
-                args=(connection, "{}:{}".format(*address[:2])),
-                name="plumbmate-bridge",
-                daemon=True,
-            )
+            try:
+                worker = threading.Thread(
+                    target=self._serve_connection,
+                    args=(connection, "{}:{}".format(*address[:2])),
+                    name="plumbmate-bridge",
+                    daemon=True,
+                )
+                worker.start()
+            except Exception:
+                with self._lock:
+                    self._connections.discard(connection)
+                connection.close()
+                self._slots.release()
+                self._count("acceptor_errors")
+                continue
             self._workers.append(worker)
-            worker.start()
 
     def _serve_connection(self, connection: socket.socket, peer: str) -> None:
         stream = _FrameStream(connection, self._max_frame_bytes)
         try:
+            deadline = time.monotonic() + self._handshake_timeout
             connection.settimeout(self._handshake_timeout)
             nonce = secrets.token_hex(NONCE_BYTES)
             stream.write_frame({
                 "protocol_version": PROTOCOL_VERSION, "kind": "challenge", "nonce": nonce,
             })
-            if not self._authenticate(stream.read_frame(), nonce):
+            hello = stream.read_frame(deadline=deadline)
+            if not self._authenticate(hello, nonce):
                 self._count("failed_handshakes")
                 stream.write_frame({
                     "protocol_version": PROTOCOL_VERSION,
                     "kind": "error", "reason": "unauthorized",
                 })
                 return
-            stream.write_frame({"protocol_version": PROTOCOL_VERSION, "kind": "welcome"})
+            capabilities = hello.get("capabilities", [])
+            stream.delivery_enabled = (self._delivery_reader is not None
+                                       and isinstance(capabilities, list)
+                                       and CAPABILITY in capabilities)
+            stream.write_frame({"protocol_version": PROTOCOL_VERSION, "kind": "welcome",
+                                "capabilities": [CAPABILITY] if stream.delivery_enabled else []})
             connection.settimeout(self._idle_timeout)
             self._event_loop(stream, peer)
         except ProtocolError as exc:
@@ -418,6 +494,10 @@ class EventSocketServer:
         except (OSError, ConnectionError, ValueError):
             # A disconnect or malformed peer ends this connection and nothing else.
             pass
+        except Exception:
+            # Unexpected peer-local failures must neither leak slots nor print
+            # untrusted payloads. Keep a count for diagnostics.
+            self._count("worker_errors")
         finally:
             with self._lock:
                 self._connections.discard(connection)
@@ -425,6 +505,7 @@ class EventSocketServer:
             self._slots.release()
 
     def _event_loop(self, stream: _FrameStream, peer: str) -> None:
+        next_delivery_at = 0.0
         while not self._stopping.is_set():
             frame = stream.read_frame()
             try:
@@ -435,6 +516,27 @@ class EventSocketServer:
                     "protocol_version": PROTOCOL_VERSION, "kind": "error",
                     "event_id": frame.get("event_id"), "reason": str(exc),
                 })
+                continue
+            if frame["kind"] == "turn_poll":
+                # Read-only control traffic bypasses the gameplay event queue.
+                # Bound disk work per authenticated connection, without sleeping.
+                now = time.monotonic()
+                reason = "delivery_unavailable"
+                if getattr(stream, "delivery_enabled", False):
+                    reason = "delivery_rate_limited"
+                    if now >= next_delivery_at:
+                        next_delivery_at = now + DELIVERY_MIN_INTERVAL_SECONDS
+                        try:
+                            delivery = self._delivery_reader(frame.get("payload", {}))
+                            stream.write_frame({"protocol_version": PROTOCOL_VERSION,
+                                                "kind": "ack", "event_id": frame["event_id"],
+                                                "delivery": delivery})
+                            continue
+                        except (ProtocolError, OSError, ValueError):
+                            # Do not leak paths, payloads or provider errors.
+                            reason = "delivery_unavailable"
+                stream.write_frame({"protocol_version": PROTOCOL_VERSION, "kind": "error",
+                                    "event_id": frame["event_id"], "reason": reason})
                 continue
             event = BridgeEvent(
                 kind=frame["kind"],
@@ -465,7 +567,7 @@ class EventSocketServer:
         if hello.get("protocol_version") != PROTOCOL_VERSION:
             return False
         proof = hello.get("proof")
-        if not isinstance(proof, str):
+        if not isinstance(proof, str) or not proof.isascii():
             return False
         return hmac.compare_digest(proof, _proof(self._token, nonce))
 

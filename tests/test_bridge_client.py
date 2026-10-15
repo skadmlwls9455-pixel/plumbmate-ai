@@ -1,4 +1,5 @@
 import importlib.util
+import errno
 import json
 import socket
 import time
@@ -50,6 +51,24 @@ def closed_port():
 
 
 class ConstructionTests(unittest.TestCase):
+    def test_connection_intervals_reject_invalid_numbers(self):
+        for value in (0, -1, True, float("nan"), float("inf"), 3601):
+            for key in ("ack_timeout", "keepalive"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    bridge.BridgeClient(TOKEN, 1, **{key: value})
+
+    def test_duplicate_queued_identifier_cannot_lose_ack_deadline(self):
+        client = bridge.BridgeClient(TOKEN, 1)
+        client.queue_event("heartbeat", {}, event_id="same")
+        with self.assertRaises(ValueError):
+            client.queue_event("heartbeat", {}, event_id="same")
+        self.assertEqual(client.queued, 1)
+
+    def test_invalid_port_is_refused_before_connect(self):
+        for port in (-1, 0, 65536):
+            with self.subTest(port=port), self.assertRaises(ValueError):
+                bridge.BridgeClient(TOKEN, port)
+
     def test_short_token_is_refused(self):
         with self.assertRaises(ValueError):
             bridge.BridgeClient("a" * (MIN_TOKEN_CHARACTERS - 1), 1)
@@ -71,6 +90,134 @@ class ConstructionTests(unittest.TestCase):
     def test_protocol_version_matches_the_companion(self):
         from plumbmate.protocol import PROTOCOL_VERSION
         self.assertEqual(bridge.PROTOCOL_VERSION, PROTOCOL_VERSION)
+
+
+class BufferedFrameTests(unittest.TestCase):
+    """Deterministic recv schedules: no fresh bytes required to drain a batch."""
+
+    class Socket:
+        def __init__(self, chunks, eof=False):
+            self.chunks = list(chunks)
+            self.eof = eof
+            self.read_bytes = 0
+
+        def recv(self, size):
+            if not self.chunks:
+                if self.eof:
+                    return b""
+                raise BlockingIOError(errno.EWOULDBLOCK, "no new bytes")
+            chunk = self.chunks.pop(0)
+            result, remainder = chunk[:size], chunk[size:]
+            if remainder:
+                self.chunks.insert(0, remainder)
+            self.read_bytes += len(result)
+            return result
+
+        def close(self):
+            pass
+
+        def send(self, data):
+            return len(data)
+
+    def client(self, chunks, pending=(), eof=False, max_bytes=bridge.MAX_FRAME_BYTES):
+        client = bridge.BridgeClient(TOKEN, 1, max_frame_bytes=max_bytes)
+        client.state = bridge.READY
+        client._socket = self.Socket(chunks, eof)
+        client._pending = list(pending)
+        self.addCleanup(client.close)
+        return client
+
+    def ack(self, event_id):
+        return json.dumps({"kind": "ack", "event_id": event_id}).encode() + b"\n"
+
+    def test_ack_timeout_is_bounded_and_never_resends_unknown_outcome(self):
+        clock = Clock()
+        client = self.client([])
+        client._now = clock
+        client._next_keepalive = clock() + 60
+        client.queue_event("heartbeat", {})
+        client.pump()
+        self.assertEqual(client.awaiting_ack, 1)
+        clock.advance(16)
+        client.pump()
+        self.assertEqual(client.last_error, "ack_timeout")
+        self.assertEqual(client.state, bridge.BACKOFF)
+        self.assertEqual(client.queued, 0)
+        self.assertEqual(client.stats["lost_events"], 1)
+        self.assertEqual(client._pending_since, {})
+
+    def test_idle_keepalive_is_single_bounded_event_not_per_tick(self):
+        clock = Clock()
+        client = self.client([])
+        client._now = clock
+        client._next_keepalive = clock() + 60
+        for _ in range(100):
+            client.pump()
+        self.assertEqual(client.stats["sent_events"], 0)
+        clock.advance(61)
+        client.pump()
+        for _ in range(100):
+            client.pump()
+        self.assertEqual(client.stats["sent_events"], 1)
+        self.assertEqual(client.awaiting_ack, 1)
+
+    def test_ack_at_deadline_is_read_before_timeout(self):
+        clock = Clock()
+        client = self.client([])
+        client._now = clock
+        client._next_keepalive = clock() + 60
+        event_id = client.queue_event("heartbeat", {})
+        client.pump()
+        clock.advance(15)
+        client._socket.chunks.append(self.ack(event_id))
+        client.pump()
+        self.assertEqual(client.state, bridge.READY)
+        self.assertEqual(client._pending_since, {})
+
+    def test_batch_larger_than_budget_drains_without_another_recv(self):
+        ids = [str(i) for i in range(bridge.MAX_PENDING_ACKS)]
+        client = self.client([b"".join(self.ack(i) for i in ids)], ids)
+        for pump in range(4):
+            client.pump()
+            self.assertEqual(client.stats["acked_events"], (pump + 1) * 16)
+        self.assertEqual(client.awaiting_ack, 0)
+        self.assertEqual(client._inbound, b"")
+
+    def test_buffered_ack_is_processed_before_eof(self):
+        ids = [str(i) for i in range(20)]
+        client = self.client([b"".join(self.ack(i) for i in ids)], ids, eof=True)
+        client.pump()
+        client.pump()
+        self.assertEqual(client.stats["acked_events"], 20)
+        self.assertEqual(client.stats["lost_events"], 0)
+        self.assertEqual(client.state, bridge.BACKOFF)
+
+    def test_partial_frame_and_ack_after_it_are_preserved(self):
+        encoded = self.ack("a")
+        client = self.client([encoded[:8]], ["a", "b"])
+        client.pump()
+        self.assertEqual(client.awaiting_ack, 2)
+        client._socket.chunks.append(encoded[8:] + self.ack("b"))
+        client.pump()
+        self.assertEqual(client.stats["acked_events"], 2)
+
+    def test_complete_oversized_frame_is_rejected_even_with_newline(self):
+        client = self.client([self.ack("x" * 100)], max_bytes=64)
+        self.assertEqual(client.pump(), bridge.BACKOFF)
+        self.assertEqual(client.last_error, "frame_too_large")
+
+    def test_partial_large_frame_cannot_exceed_read_budget_per_tick(self):
+        client = self.client([b" " * bridge.MAX_FRAME_BYTES])
+        sock = client._socket
+        client.pump()
+        self.assertEqual(sock.read_bytes, bridge.MAX_READ_BYTES_PER_PUMP)
+        self.assertEqual(client.state, bridge.READY)
+
+    def test_duplicate_and_unknown_ack_do_not_inflate_delivery_count(self):
+        client = self.client([self.ack("a") + self.ack("a") + self.ack("unknown")], ["a"])
+        client.pump()
+        self.assertEqual(client.stats["acked_events"], 1)
+        self.assertEqual(client.stats["unknown_frames"], 2)
 
 
 class BuildEventTests(unittest.TestCase):

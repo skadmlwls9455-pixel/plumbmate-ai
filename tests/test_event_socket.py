@@ -4,6 +4,8 @@ import socket
 import stat
 import tempfile
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from pathlib import Path
 
 from plumbmate.event_socket import (
@@ -14,19 +16,94 @@ from plumbmate.event_socket import (
     BridgeClient,
     EventSocketServer,
     SocketBridgeError,
+    DEFAULT_BRIDGE_PORT,
+    _FrameStream,
     _proof,
     generate_token,
+    configured_port,
+    endpoint_path,
     load_token,
     mock_event,
     token_path,
     validate_event,
     write_token,
+    write_endpoint,
 )
 from plumbmate.protocol import PROTOCOL_VERSION, BridgePaths, ProtocolError
 
 
 TOKEN = "t" * MIN_TOKEN_CHARACTERS
 OTHER_TOKEN = "u" * MIN_TOKEN_CHARACTERS
+
+
+class EndpointTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.paths = BridgePaths(Path(temporary.name))
+
+    def test_initial_default_and_explicit_override(self):
+        self.assertEqual(configured_port(self.paths), DEFAULT_BRIDGE_PORT)
+        self.assertEqual(configured_port(self.paths, 0), 0)
+        self.assertEqual(configured_port(self.paths, 51000), 51000)
+        for port in (-1, 65536):
+            with self.assertRaises(SocketBridgeError):
+                configured_port(self.paths, port)
+
+    def test_saved_port_is_reused_and_bad_endpoint_is_not_guessed(self):
+        write_endpoint(self.paths, "127.0.0.1", 51000)
+        self.assertEqual(configured_port(self.paths), 51000)
+        for host, port in (("0.0.0.0", 51000), ("localhost", 51000), ("127.0.0.1", 70000)):
+            write_endpoint(self.paths, host, port)
+            with self.assertRaises(SocketBridgeError):
+                configured_port(self.paths)
+
+    def test_cli_keeps_configuration_on_exit_and_reuses_it(self):
+        from plumbmate.cli import main
+        event = SimpleNamespace(kind="heartbeat", event_id="test", payload={}, received_at="test")
+        with mock.patch("plumbmate.cli.load_token", return_value=TOKEN), \
+             mock.patch("plumbmate.cli.EventSocketServer") as factory, \
+             mock.patch("builtins.print"):
+            factory.return_value.port = 51991
+            factory.return_value.poll.return_value = event
+            args = ["listen", "--bridge", str(self.paths.root), "--events", "1"]
+            self.assertEqual(main(args + ["--port", "0"]), 0)
+            self.assertEqual(configured_port(self.paths), 51991)
+            self.assertEqual(main(args), 0)
+            self.assertEqual([call.kwargs["port"] for call in factory.call_args_list], [0, 51991])
+            self.assertEqual(factory.return_value.stop.call_count, 2)
+
+    def test_port_conflict_leaves_existing_configuration_unchanged(self):
+        from plumbmate.cli import main
+        with EventSocketServer(TOKEN) as other:
+            write_endpoint(self.paths, "127.0.0.1", other.port)
+            before = endpoint_path(self.paths).read_bytes()
+            with mock.patch("plumbmate.cli.load_token", return_value=TOKEN), \
+                 mock.patch("builtins.print") as output:
+                self.assertEqual(main(["listen", "--bridge", str(self.paths.root)]), 2)
+            self.assertEqual(endpoint_path(self.paths).read_bytes(), before)
+            self.assertIn("no alternate port", output.call_args.args[0])
+
+
+class FrameBoundaryTests(unittest.TestCase):
+    class Socket:
+        def __init__(self, data):
+            self.data = data
+
+        def recv(self, size):
+            chunk, self.data = self.data[:size], self.data[size:]
+            return chunk
+
+    def test_completed_oversized_frame_cannot_bypass_limit(self):
+        stream = _FrameStream(self.Socket(b'{"value":"' + b"x" * 80 + b'"}\n'), 64)
+        with self.assertRaises(ProtocolError):
+            stream.read_frame()
+
+    def test_limit_includes_newline_and_accepts_exact_boundary(self):
+        data = b'{}' + b' ' * 61 + b'\n'
+        self.assertEqual(_FrameStream(self.Socket(data), 64).read_frame(), {})
+        with self.assertRaises(ProtocolError):
+            _FrameStream(self.Socket(data), 63).read_frame()
 
 
 class TokenTests(unittest.TestCase):

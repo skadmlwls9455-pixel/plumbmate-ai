@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import shutil
+import uuid
 from pathlib import Path
-from typing import Any
 
-from .budget import clamp_request, state_delta
+from .budget import SessionBudget, clamp_request
 from .protocol import (
     BridgePaths,
+    ProtocolError,
     atomic_write_json,
     pending_requests,
     read_json,
@@ -17,28 +17,72 @@ from .protocol import (
     validate_response,
 )
 from .providers import Provider
+from .turn_status import write_turn_status
+from .pricing import SpendingBlocked
+from .dialogue import RoleSetupRequired, dialogue_context
 
 
 class CompanionEngine:
-    def __init__(self, paths: BridgePaths, provider: Provider) -> None:
+    def __init__(self, paths: BridgePaths, provider: Provider, *, max_attempts: int = 20) -> None:
         self.paths = paths
         self.provider = provider
         self.paths.ensure()
+        self.rejected_requests = 0
+        self.budget = SessionBudget(max_attempts=max_attempts)
+
+    def _quarantine(self, path: Path) -> None:
+        destination = self.paths.archive / "rejected"
+        destination.mkdir(exist_ok=True)
+        shutil.move(str(path), str(destination / (uuid.uuid4().hex + ".json")))
+        self.rejected_requests += 1
 
     def process_one(self) -> Path | None:
-        request_path = next(iter(pending_requests(self.paths)), None)
-        if request_path is None:
-            return None
-        request = clamp_request(read_json(request_path))
-        validate_request(request)
-        model_request, snapshot, prior_facts = self._prepare_request(request)
-        response = self.provider.respond(model_request)
-        validate_response(response)
-        response_path = self.paths.responses / f"{request['request_id']}.json"
-        atomic_write_json(response_path, response)
-        self._save_session(request["session_id"], snapshot, prior_facts, response)
-        shutil.move(str(request_path), str(self.paths.archive / request_path.name))
-        return response_path
+        for index, request_path in enumerate(pending_requests(self.paths)):
+            if index >= 16:
+                return None
+            try:
+                request = read_json(request_path)
+                validate_request(request)
+                if request_path.stem != request["request_id"]:
+                    raise ProtocolError("Request filename and identifier differ")
+                # No verified save receipt exists in this alpha. A household
+                # ID cannot authorize cross-turn state or factual memory reuse.
+                request["memory_summary"] = ""
+                request["state_delta"] = {}
+                request = clamp_request(request)
+                dialogue_context(request)
+            except ProtocolError as exc:
+                reason = "roles_required" if isinstance(exc, RoleSetupRequired) else "invalid_request"
+                write_turn_status(self.paths, request_path.stem, "failed", reason)
+                self._quarantine(request_path)
+                continue
+            response_path = self.paths.responses / f"{request['request_id']}.json"
+            if response_path.exists():
+                self._quarantine(request_path)
+                continue
+            if not self.budget.reserve(request):
+                write_turn_status(self.paths, request["request_id"], "failed", "session_limit")
+                self._quarantine(request_path)
+                continue
+            write_turn_status(self.paths, request["request_id"], "processing")
+            try:
+                response = self.provider.respond(request)
+                validate_response(response, expected_request_id=request["request_id"])
+                response = dict(response, memory_patch=[])
+                validate_response(response, expected_request_id=request["request_id"])
+                atomic_write_json(response_path, response)
+            except Exception as exc:
+                # Timeouts may already incur charges: retain, never auto-retry.
+                reason = "spending_blocked" if isinstance(exc, SpendingBlocked) else "provider_failed"
+                write_turn_status(self.paths, request["request_id"], "failed", reason)
+                self._quarantine(request_path)
+                if isinstance(exc, SpendingBlocked):
+                    raise SpendingBlocked(str(exc)) from None
+                raise ProtocolError("Turn failed; retained in archive/rejected; no automatic retry") from exc
+            shutil.move(str(request_path), str(self.paths.archive / request_path.name))
+            write_turn_status(self.paths, request["request_id"], "completed")
+            return response_path
+        return None
 
     def process_all(self) -> list[Path]:
         completed: list[Path] = []
@@ -47,61 +91,3 @@ class CompanionEngine:
             if result is None:
                 return completed
             completed.append(result)
-
-    def _session_path(self, session_id: str) -> Path:
-        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
-        return self.paths.state / f"session-{digest}.json"
-
-    def _prepare_request(
-        self, request: dict[str, Any]
-    ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-        session_path = self._session_path(str(request["session_id"]))
-        previous: dict[str, Any] = {}
-        if session_path.exists():
-            previous = read_json(session_path)
-        prior_snapshot = previous.get("snapshot", {})
-        prior_facts = [str(item)[:240] for item in previous.get("memory_facts", [])[-12:]]
-        snapshot = {
-            "game": request.get("game", {}),
-            "actor": request.get("actor", {}),
-            "household": request.get("household", []),
-        }
-
-        prepared = dict(request)
-        if prior_snapshot:
-            delta = state_delta(prior_snapshot, snapshot)
-            prepared["state_delta"] = delta
-            actor = request.get("actor", {})
-            prepared["actor"] = {
-                "sim_id": actor.get("sim_id", "unknown"),
-                "name": actor.get("name", "Unknown Sim"),
-            }
-            if "game" not in delta:
-                prepared["game"] = {}
-            if "household" not in delta:
-                prepared["household"] = []
-        else:
-            prepared["state_delta"] = {}
-
-        if prior_facts:
-            supplied = str(prepared.get("memory_summary", "")).strip()
-            local_summary = " | ".join(prior_facts[-8:])
-            prepared["memory_summary"] = (supplied + " | " + local_summary).strip(" |")[:1600]
-        return clamp_request(prepared), snapshot, prior_facts
-
-    def _save_session(
-        self,
-        session_id: str,
-        snapshot: dict[str, Any],
-        prior_facts: list[str],
-        response: dict[str, Any],
-    ) -> None:
-        facts = prior_facts + [str(item)[:240] for item in response.get("memory_patch", [])]
-        deduplicated: list[str] = []
-        for fact in facts:
-            if fact and fact not in deduplicated:
-                deduplicated.append(fact)
-        atomic_write_json(
-            self._session_path(str(session_id)),
-            {"snapshot": snapshot, "memory_facts": deduplicated[-12:]},
-        )

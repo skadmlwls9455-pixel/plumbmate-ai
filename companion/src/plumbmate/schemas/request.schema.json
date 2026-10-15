@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/plumbmate/request.schema.json",
+  "title": "PlumbMate turn request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "kind",
+    "created_at",
+    "player_message",
+    "session_id",
+    "actor"
+  ],
+  "properties": {
+    "protocol_version": {"const": "0.1"},
+    "request_id": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$"},
+    "kind": {"const": "turn"},
+    "created_at": {"type": "string", "minLength": 1, "maxLength": 40},
+    "player_message": {"type": "string", "maxLength": 1000},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "roles": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binding_id", "scene_id", "player_sim_id", "partner_sim_id"],
+      "properties": {
+        "binding_id": {"type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32},
+        "scene_id": {"type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32},
+        "player_sim_id": {"$ref": "#/$defs/sim_id"},
+        "partner_sim_id": {"$ref": "#/$defs/sim_id"}
+      }
+    },
+    "game": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "maxLength": 80},
+        "adapter": {"type": "string", "maxLength": 80},
+        "version": {"type": "string", "maxLength": 40}
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sim_id", "name"],
+      "properties": {
+        "sim_id": {"$ref": "#/$defs/sim_id"},
+        "name": {"type": "string", "maxLength": 128},
+        "age": {"type": "string", "maxLength": 40},
+        "gender": {"type": "string", "maxLength": 40},
+        "mood": {"type": "string", "maxLength": 80}
+      }
+    },
+    "household": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sim_id", "name"],
+        "properties": {
+          "sim_id": {"$ref": "#/$defs/sim_id"},
+          "name": {"type": "string", "maxLength": 128}
+        }
+      }
+    },
+    "state_delta": {
+      "description": "Reserved; only empty while save scope is unverified.",
+      "type": "object", "additionalProperties": false
+    },
+    "recent_events": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string", "maxLength": 240}
+    },
+    "memory_summary": {"type": "string", "maxLength": 1600}
+  },
+  "$defs": {
+    "sim_id": {
+      "anyOf": [
+        {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        {"type": "string", "minLength": 1, "maxLength": 20, "pattern": "^[0-9]+$"}
+      ]
+    }
+  }
+}

@@ -60,6 +60,17 @@ def build(output: Path, game_app: Path = DEFAULT_GAME_APP, *, diagnostic: bool =
         compile_units.extend([
             (source_root / "plumbmate_mod" / "bridge_client.py", Path("plumbmate_bridge_client.pyc")),
             (source_root / "plumbmate_mod" / "tick_driver.py", Path("plumbmate_tick_driver.pyc")),
+            (source_root / "plumbmate_mod" / "turn_bridge.py", Path("plumbmate_turn_bridge.pyc")),
+            (source_root / "plumbmate_mod" / "role_binding.py", Path("plumbmate_role_binding.pyc")),
+            (source_root / "plumbmate_mod" / "role_setup_ui.py", Path("plumbmate_role_setup_ui.pyc")),
+            (source_root / "plumbmate_mod" / "chat_input.py", Path("plumbmate_chat_input.pyc")),
+            (source_root / "plumbmate_mod" / "chat_ui.py", Path("plumbmate_chat_ui.pyc")),
+            (source_root / "plumbmate_mod" / "control_ui.py", Path("plumbmate_control_ui.pyc")),
+            (source_root / "plumbmate_mod" / "scene_adapter.py", Path("plumbmate_scene_adapter.pyc")),
+            (source_root / "plumbmate_mod" / "conversation_state.py", Path("plumbmate_conversation_state.pyc")),
+            (source_root / "plumbmate_mod" / "reply_delivery.py", Path("plumbmate_reply_delivery.pyc")),
+            (source_root / "plumbmate_mod" / "reply_presenter.py", Path("plumbmate_reply_presenter.pyc")),
+            (source_root / "plumbmate_mod" / "bridge_lifecycle.py", Path("plumbmate_bridge_lifecycle.pyc")),
         ])
 
     library, base_zip, core_zip = _game_paths(game_app)

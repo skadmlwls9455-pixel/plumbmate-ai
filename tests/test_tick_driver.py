@@ -1,4 +1,5 @@
 import importlib.util
+import functools
 import time
 import unittest
 from pathlib import Path
@@ -41,6 +42,9 @@ class RecordingClient(object):
         self.pumps += 1
         return self.result
 
+    def close(self):
+        pass
+
 
 class ExplodingClient(object):
     def __init__(self):
@@ -52,6 +56,29 @@ class ExplodingClient(object):
 
 
 class DriverTests(unittest.TestCase):
+    def test_ui_lifecycle_runs_offline_but_not_after_stop(self):
+        seen = []
+        driver = driver_module.TickDriver(before_pump=lambda: seen.append("ui"),
+                                          on_suspend=lambda: seen.append("close"))
+        driver.on_tick()
+        driver.suspend()
+        driver.on_tick()
+        self.assertEqual(seen, ["ui", "close"])
+
+    def test_ui_failure_cannot_disable_or_delay_transport(self):
+        def broken():
+            raise ValueError("UI unavailable")
+        client = RecordingClient()
+        driver = driver_module.TickDriver(client, before_pump=broken, on_suspend=broken)
+        for _ in range(20):
+            self.assertTrue(driver.on_tick())
+        self.assertEqual(client.pumps, 20)
+        self.assertIsNone(driver.disabled_reason)
+        self.assertEqual(driver.stats["errors"], 0)
+        self.assertEqual(driver.last_ui_error, "ValueError")
+        driver.suspend()
+        self.assertFalse(driver.active)
+
     def test_idle_driver_does_not_pump(self):
         driver = driver_module.TickDriver()
         self.assertFalse(driver.active)
@@ -136,11 +163,26 @@ class DriverTests(unittest.TestCase):
         self.assertFalse(driver.on_tick(1))
         self.assertEqual(client.pumps, 0)
 
+    def test_suspend_blocks_binder_and_attach_until_explicit_resume(self):
+        calls = []
+        client = RecordingClient()
+        driver = driver_module.TickDriver(binder=lambda current: calls.append(current))
+        driver.suspend()
+        driver.attach(client)
+        for tick in range(20):
+            self.assertFalse(driver.on_tick(tick))
+        self.assertEqual(calls, [])
+        self.assertEqual(client.pumps, 0)
+        driver.resume()
+        self.assertTrue(driver.on_tick(21))
+        self.assertEqual(client.pumps, 1)
+
 
 class HookTests(unittest.TestCase):
     def setUp(self):
         self.original = FakeZone.update
         self.addCleanup(setattr, FakeZone, "update", self.original)
+        self.addCleanup(driver_module.remove_tick_hook, FakeZone)
         self.client = RecordingClient()
         self.driver = driver_module.TickDriver(self.client)
         self.zone = FakeZone()
@@ -199,6 +241,65 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.zone.update(3), "engine-result")
         self.assertEqual(self.zone.seen, [3])
 
+    def _foreign_wrapper(self, copy_attributes):
+        original = FakeZone.update
+        calls = []
+
+        def foreign(zone, *args, **kwargs):
+            calls.append(args)
+            return original(zone, *args, **kwargs)
+
+        if copy_attributes:
+            foreign = functools.wraps(original)(foreign)
+        FakeZone.update = foreign
+        return foreign, calls
+
+    def test_wraps_copied_markers_do_not_grant_unhook_ownership(self):
+        driver_module.install_tick_hook(FakeZone, self.driver)
+        foreign, calls = self._foreign_wrapper(True)
+        self.assertTrue(getattr(foreign, driver_module.HOOK_MARKER))
+        self.assertFalse(driver_module.remove_tick_hook(FakeZone))
+        self.assertIs(FakeZone.update, foreign)
+        self.assertFalse(driver_module.is_hooked(FakeZone))
+        self.assertEqual(self.zone.update(1), "engine-result")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.client.pumps, 0)
+
+    def test_restart_under_an_unmarked_wrapper_pumps_only_once(self):
+        driver_module.install_tick_hook(FakeZone, self.driver)
+        foreign, calls = self._foreign_wrapper(False)
+        self.assertFalse(driver_module.remove_tick_hook(FakeZone))
+        self.assertTrue(driver_module.install_tick_hook(FakeZone, self.driver))
+        self.zone.update(1)
+        self.assertEqual(self.client.pumps, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(driver_module.remove_tick_hook(FakeZone))
+        self.assertIs(FakeZone.update, foreign)
+        self.zone.update(2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.client.pumps, 1)
+
+    def test_reload_reuses_exact_wrapper_with_new_driver(self):
+        driver_module.install_tick_hook(FakeZone, self.driver)
+        original_wrapper = FakeZone.update
+        reloaded = _load("tick_driver_reloaded", "tick_driver.py")
+        client = RecordingClient()
+        self.assertFalse(reloaded.install_tick_hook(FakeZone, reloaded.TickDriver(client)))
+        self.assertIs(FakeZone.update, original_wrapper)
+        self.zone.update(1)
+        self.assertEqual(self.client.pumps, 0)
+        self.assertEqual(client.pumps, 1)
+        self.assertTrue(reloaded.remove_tick_hook(FakeZone))
+        self.assertIs(FakeZone.update, self.original)
+
+    def test_uncaught_driver_failure_does_not_escape_wrapper(self):
+        def broken_tick(_tick):
+            raise RuntimeError("broken driver")
+        self.driver.on_tick = broken_tick
+        driver_module.install_tick_hook(FakeZone, self.driver)
+        self.assertEqual(self.zone.update(1), "engine-result")
+        self.assertFalse(driver_module.is_hooked(FakeZone))
+
 
 class FakeClock(object):
     def __init__(self):
@@ -221,6 +322,13 @@ class BinderTests(unittest.TestCase):
         return driver_module.TickDriver(
             binder=binder, bind_interval_seconds=interval, now=self.clock,
         )
+
+    def test_failing_clock_is_contained_like_a_failing_binder(self):
+        def broken_clock():
+            raise RuntimeError("clock failure")
+        driver = driver_module.TickDriver(binder=lambda current: None, now=broken_clock)
+        self.assertFalse(driver.on_tick(1))
+        self.assertEqual(driver.stats["bind_errors"], 1)
 
     def test_driver_stays_idle_while_the_binder_supplies_nothing(self):
         driver = self.driver(lambda current: None)

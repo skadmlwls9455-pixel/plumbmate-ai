@@ -35,6 +35,7 @@ DEFAULT_BIND_INTERVAL_SECONDS = 5.0
 
 HOOK_MARKER = "_plumbmate_tick_hook"
 ORIGINAL_MARKER = "_plumbmate_original"
+REGISTRY_ATTRIBUTE = "_plumbmate_tick_hooks_v1"
 
 
 class TickDriver(object):
@@ -48,10 +49,17 @@ class TickDriver(object):
         binder=None,
         bind_interval_seconds=DEFAULT_BIND_INTERVAL_SECONDS,
         now=None,
+        after_pump=None,
+        before_pump=None,
+        on_suspend=None,
     ):
         if int(every_n_ticks) < 1:
             raise ValueError("every_n_ticks must be at least 1")
         self._client = client
+        self.after_pump = after_pump
+        self.before_pump = before_pump
+        self.on_suspend = on_suspend
+        self.last_ui_error = None
         self._every = int(every_n_ticks)
         self._max_consecutive_errors = int(max_consecutive_errors)
         self._binder = binder
@@ -60,6 +68,7 @@ class TickDriver(object):
         self._next_bind_at = 0.0
         self._counter = 0
         self._consecutive_errors = 0
+        self._suspended = False
         self.disabled_reason = None
         self.last_state = None
         self.last_error = None
@@ -75,7 +84,17 @@ class TickDriver(object):
 
     @property
     def active(self):
-        return self._client is not None and self.disabled_reason is None
+        return (not self._suspended and self._client is not None
+                and self.disabled_reason is None)
+
+    def suspend(self):
+        """Stop both binding and pumping, even if another mod retains our hook."""
+        self._suspended = True
+        if self.on_suspend is not None:
+            try:
+                self.on_suspend()
+            except Exception as exc:
+                self.last_ui_error = type(exc).__name__
 
     def attach(self, client):
         """Bind a client and clear any previous disable."""
@@ -93,6 +112,7 @@ class TickDriver(object):
         return client
 
     def resume(self):
+        self._suspended = False
         self.disabled_reason = None
         self._consecutive_errors = 0
 
@@ -106,12 +126,12 @@ class TickDriver(object):
 
     def _try_bind(self):
         """Ask the binder for a client. Swallows everything; runs on the engine."""
-        now = self._now()
-        if now < self._next_bind_at:
-            return False
-        self._next_bind_at = now + self._bind_interval
-        self.stats["bind_attempts"] += 1
         try:
+            now = self._now()
+            if now < self._next_bind_at:
+                return False
+            self._next_bind_at = now + self._bind_interval
+            self.stats["bind_attempts"] += 1
             client = self._binder(self._client)
         except BaseException as exc:
             self.stats["bind_errors"] += 1
@@ -126,8 +146,19 @@ class TickDriver(object):
         return True
 
     def on_tick(self, absolute_ticks=None):
-        """Advance the client by at most one pump. Never raises, never blocks."""
+        """Advance once. Binders must be memory-only; pumps must be nonblocking."""
         self.stats["ticks"] += 1
+        if self._suspended:
+            self.stats["skipped"] += 1
+            return False
+        # UI lifecycle is independent of companion availability. Its failure
+        # must not disable the transport or accumulate pump-failure strikes.
+        before_pump = self.before_pump
+        if before_pump is not None:
+            try:
+                before_pump()
+            except Exception as exc:
+                self.last_ui_error = type(exc).__name__
         if self._binder is not None:
             self._try_bind()
         if not self.active:
@@ -140,6 +171,8 @@ class TickDriver(object):
         self._counter = 0
         try:
             self.last_state = self._client.pump()
+            if self.after_pump is not None:
+                self.after_pump(self._client)
         except BaseException as exc:
             # pump() already fails closed; this is the last line before the engine.
             self._consecutive_errors += 1
@@ -155,40 +188,75 @@ class TickDriver(object):
 
 
 def is_hooked(target_class, method_name="update"):
-    return getattr(getattr(target_class, method_name, None), HOOK_MARKER, False)
+    record = target_class.__dict__.get(REGISTRY_ATTRIBUTE, {}).get(method_name)
+    return bool(record and record["enabled"])
 
 
 def install_tick_hook(target_class, driver, method_name="update"):
     """Wrap ``method_name`` so the driver ticks after the original returns.
 
-    Idempotent: a second call on an already hooked class changes nothing and
-    returns False, so a reloaded mod cannot stack wrappers.
+    Ownership lives on the target class, not in copyable function attributes.
+    On reload the exact owned wrapper can be reused with the new driver. If
+    someone wrapped/replaced it, disable the old inner wrapper before adding
+    an outer one. Never attempt to splice an unknown third-party wrapper chain.
     """
     original = getattr(target_class, method_name, None)
     if original is None:
         raise AttributeError(
             "{} has no method {}".format(getattr(target_class, "__name__", target_class), method_name)
         )
-    if getattr(original, HOOK_MARKER, False):
+    registry = target_class.__dict__.get(REGISTRY_ATTRIBUTE)
+    if registry is None:
+        registry = {}
+        setattr(target_class, REGISTRY_ATTRIBUTE, registry)
+    previous = registry.get(method_name)
+    if previous is not None and previous["driver"] is not driver:
+        previous["driver"].suspend()
+        old_client = previous["driver"].detach()
+        if old_client is not None:
+            old_client.close()
+    if previous is not None and original is previous["wrapper"]:
+        previous["driver"] = driver
+        previous["enabled"] = True
         return False
+    if previous is not None:
+        previous["enabled"] = False
+    record = {"driver": driver, "original": original, "enabled": True}
 
     def plumbmate_tick_wrapper(self, *args, **kwargs):
         # Gameplay first. A failure in the original must not be hidden by ours.
         result = original(self, *args, **kwargs)
-        driver.on_tick(args[0] if args else None)
+        if record["enabled"]:
+            try:
+                record["driver"].on_tick(args[0] if args else None)
+            except BaseException:
+                # Contain even a broken driver replacement, not engine errors.
+                record["enabled"] = False
         return result
 
     setattr(plumbmate_tick_wrapper, HOOK_MARKER, True)
     setattr(plumbmate_tick_wrapper, ORIGINAL_MARKER, original)
     plumbmate_tick_wrapper.__name__ = getattr(original, "__name__", method_name)
+    record["wrapper"] = plumbmate_tick_wrapper
+    registry[method_name] = record
     setattr(target_class, method_name, plumbmate_tick_wrapper)
     return True
 
 
 def remove_tick_hook(target_class, method_name="update"):
-    """Restore the original method. Returns False when nothing was hooked."""
+    """Disable ours; restore only if the outermost function is exactly ours.
+
+    False means no restoration occurred (absent hook or another mod outside
+    ours). In that case the foreign chain is preserved and ours stays inert.
+    """
     current = getattr(target_class, method_name, None)
-    if not getattr(current, HOOK_MARKER, False):
+    registry = target_class.__dict__.get(REGISTRY_ATTRIBUTE, {})
+    record = registry.get(method_name)
+    if record is None:
         return False
-    setattr(target_class, method_name, getattr(current, ORIGINAL_MARKER))
+    record["enabled"] = False
+    if current is not record["wrapper"]:
+        return False
+    setattr(target_class, method_name, record["original"])
+    del registry[method_name]
     return True

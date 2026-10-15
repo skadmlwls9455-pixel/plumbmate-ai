@@ -6,6 +6,7 @@ flush local diagnostic logs. No patching, network, save access, or queue reset.
 
 import json
 import os
+import re
 import time
 import uuid
 
@@ -29,10 +30,10 @@ LISTENER = None
 
 def _root():
     source = os.path.abspath(__file__)
-    marker = source.lower().find(".ts4script")
-    if marker < 0:
+    marker = re.search(r"\.ts4script(?=[/\\]|$)", source, re.IGNORECASE | re.ASCII)
+    if marker is None:
         raise RuntimeError("Not running from the diagnostic archive")
-    return os.path.join(os.path.dirname(source[:marker + len(".ts4script")]), "PlumbMateDiagnostics")
+    return os.path.join(os.path.dirname(source[:marker.end()]), "PlumbMateDiagnostics")
 
 
 def _write(name, payload):

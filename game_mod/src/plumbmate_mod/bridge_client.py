@@ -52,6 +52,9 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 30.0
+ACK_TIMEOUT_SECONDS = 15.0
+KEEPALIVE_SECONDS = 60.0
+DELIVERY_CAPABILITY = "turn_delivery_v1"
 
 # Must stay identical to the companion's transport allow list. It bounds what
 # the socket carries and says nothing about whether an event may be acted on.
@@ -62,6 +65,7 @@ ALLOWED_EVENT_KINDS = frozenset((
     "save_committed",
     "interaction_started",
     "chat_turn",
+    "turn_poll",
 ))
 
 DISCONNECTED = "DISCONNECTED"
@@ -94,7 +98,9 @@ _ALREADY_CONNECTED = _errno_set("EISCONN", "WSAEISCONN")
 def _is_loopback(host):
     """Accept only a literal 127.0.0.0/8 address; this client is AF_INET."""
     parts = host.split(".") if isinstance(host, str) else []
-    if len(parts) != 4 or not all(part.isdigit() and len(part) <= 3 for part in parts):
+    if len(parts) != 4 or not all(
+            1 <= len(part) <= 3 and all("0" <= digit <= "9" for digit in part)
+            and (len(part) == 1 or part[0] != "0") for part in parts):
         return False
     octets = [int(part) for part in parts]
     return octets[0] == 127 and all(0 <= octet <= 255 for octet in octets)
@@ -140,6 +146,8 @@ class BridgeClient(object):
         max_backoff=MAX_BACKOFF_SECONDS,
         max_outbox=MAX_OUTBOX_EVENTS,
         max_frame_bytes=MAX_FRAME_BYTES,
+        ack_timeout=ACK_TIMEOUT_SECONDS,
+        keepalive=KEEPALIVE_SECONDS,
     ):
         if not isinstance(token, str) or len(token.strip()) < MIN_TOKEN_CHARACTERS:
             raise ValueError(
@@ -150,6 +158,8 @@ class BridgeClient(object):
         self._token = token
         self._host = host
         self._port = int(port)
+        if not 1 <= self._port <= 65535:
+            raise ValueError("Bridge port must be between 1 and 65535")
         self._now = now or time.monotonic
         self._connect_timeout = connect_timeout
         self._handshake_timeout = handshake_timeout
@@ -157,6 +167,12 @@ class BridgeClient(object):
         self._max_backoff = max_backoff
         self._max_outbox = max_outbox
         self._max_frame_bytes = max_frame_bytes
+        for interval in (ack_timeout, keepalive):
+            if type(interval) not in (int, float) or not 0 < interval <= 3600:
+                raise ValueError("Connection deadlines must be finite positive seconds, at most 3600")
+        self._ack_timeout = ack_timeout
+        self._keepalive = keepalive
+        self._next_keepalive = self._now() + keepalive
 
         self.state = DISCONNECTED
         self.last_error = None
@@ -174,6 +190,28 @@ class BridgeClient(object):
         self._outbound = bytearray()
         self._outbox = []
         self._pending = []
+        self._pending_since = {}
+        self.supports_turn_delivery = False
+        self._delivery_event_id = None
+        self._delivery_reply = None
+
+    def request_turn_delivery(self, scope):
+        """One read-only lookup in flight, never a model call or resend."""
+        if not self.connected or not self.supports_turn_delivery or self._delivery_event_id:
+            return None
+        self._delivery_event_id = self.queue_event("turn_poll", scope)
+        return self._delivery_event_id
+
+    def take_turn_delivery(self):
+        reply, self._delivery_reply = self._delivery_reply, None
+        return reply
+
+    def _clear_delivery(self):
+        # Unlike user events, unsent lookups must not survive a connection epoch.
+        self._outbox = [item for item in self._outbox if item[0] != self._delivery_event_id]
+        self._delivery_event_id = None
+        self._delivery_reply = None
+        self.supports_turn_delivery = False
 
     @property
     def connected(self):
@@ -200,6 +238,9 @@ class BridgeClient(object):
         instead of being cut off mid-frame by the server.
         """
         frame = build_event(kind, payload, event_id)
+        if (frame["event_id"] in self._pending
+                or any(item[0] == frame["event_id"] for item in self._outbox)):
+            raise ValueError("Duplicate queued event identifier")
         encoded = json.dumps(frame, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(encoded) + 1 > self._max_frame_bytes:
             raise ValueError("Event frame exceeds the maximum size")
@@ -221,8 +262,10 @@ class BridgeClient(object):
 
     def close(self):
         """Release the socket. Queued events are kept; in-flight ones are lost."""
+        self._clear_delivery()
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
+        self._pending_since.clear()
         self._close_socket()
         self._inbound = bytearray()
         self._outbound = bytearray()
@@ -257,6 +300,11 @@ class BridgeClient(object):
             return
         self._read_frames()
         if self.state == READY:
+            if any(now - sent_at >= self._ack_timeout for sent_at in self._pending_since.values()):
+                self._fail("ack_timeout")
+                return
+            if not self._pending and not self._outbox and now >= self._next_keepalive:
+                self.queue_event("heartbeat", {"source": "transport_keepalive"})
             self._encode_outbox()
         if self._socket is not None:
             self._flush_outbound()
@@ -296,9 +344,28 @@ class BridgeClient(object):
     def _read_frames(self):
         read_bytes = 0
         frames = 0
-        while read_bytes < MAX_READ_BYTES_PER_PUMP and frames < MAX_FRAMES_PER_PUMP:
+        while frames < MAX_FRAMES_PER_PUMP:
+            # A previous pump may have hit its frame budget with complete
+            # frames still buffered. Drain those BEFORE recv/EAGAIN/EOF.
+            index = self._inbound.find(b"\n")
+            if index >= 0:
+                if index + 1 > self._max_frame_bytes:
+                    self._fail("frame_too_large")
+                    return
+                raw = bytes(self._inbound[:index])
+                del self._inbound[: index + 1]
+                frames += 1
+                self._handle_frame(raw)
+                if self.state in (BACKOFF, CLOSED):
+                    return
+                continue
+            if len(self._inbound) >= self._max_frame_bytes:
+                self._fail("frame_too_large")
+                return
+            if read_bytes >= MAX_READ_BYTES_PER_PUMP:
+                return
             try:
-                chunk = self._socket.recv(4096)
+                chunk = self._socket.recv(min(4096, MAX_READ_BYTES_PER_PUMP - read_bytes))
             except OSError as exc:
                 if exc.errno in _RETRY_LATER:
                     return
@@ -309,18 +376,6 @@ class BridgeClient(object):
                 return
             read_bytes += len(chunk)
             self._inbound.extend(chunk)
-            while frames < MAX_FRAMES_PER_PUMP:
-                index = self._inbound.find(b"\n")
-                if index < 0:
-                    if len(self._inbound) > self._max_frame_bytes:
-                        self._fail("frame_too_large")
-                    return
-                raw = bytes(self._inbound[:index])
-                del self._inbound[: index + 1]
-                frames += 1
-                self._handle_frame(raw)
-                if self.state in (BACKOFF, CLOSED):
-                    return
 
     def _handle_frame(self, raw):
         try:
@@ -340,6 +395,7 @@ class BridgeClient(object):
             self._write_frame({
                 "protocol_version": PROTOCOL_VERSION, "kind": "hello",
                 "proof": _proof(self._token, nonce),
+                "capabilities": [DELIVERY_CAPABILITY],
             })
             self.state = AWAITING_WELCOME
         elif self.state == AWAITING_WELCOME:
@@ -347,11 +403,20 @@ class BridgeClient(object):
                 self._fail(str(frame.get("reason", "handshake_refused")))
                 return
             self.state = READY
+            capabilities = frame.get("capabilities", [])
+            self.supports_turn_delivery = (isinstance(capabilities, list)
+                                           and DELIVERY_CAPABILITY in capabilities)
             self._backoff = 0.0
             self.last_error = None
             self.stats["handshakes"] += 1
+            self._next_keepalive = self._now() + self._keepalive
         elif self.state == READY:
             if kind == "ack":
+                if (frame.get("event_id") == self._delivery_event_id
+                        and self._delivery_event_id in self._pending):
+                    delivery = frame.get("delivery")
+                    if isinstance(delivery, dict):
+                        self._delivery_reply = delivery
                 self._resolve(frame.get("event_id"), True, None)
             elif kind == "error":
                 self._resolve(frame.get("event_id"), False, frame.get("reason"))
@@ -359,8 +424,13 @@ class BridgeClient(object):
                 self.stats["unknown_frames"] += 1
 
     def _resolve(self, event_id, accepted, reason):
-        if event_id in self._pending:
-            self._pending.remove(event_id)
+        if event_id not in self._pending:
+            self.stats["unknown_frames"] += 1
+            return
+        self._pending.remove(event_id)
+        if event_id == self._delivery_event_id:
+            self._delivery_event_id = None
+        self._pending_since.pop(event_id, None)
         if accepted:
             self.stats["acked_events"] += 1
         else:
@@ -375,6 +445,8 @@ class BridgeClient(object):
             event_id, encoded = self._outbox.pop(0)
             self._outbound.extend(encoded)
             self._pending.append(event_id)
+            self._pending_since[event_id] = self._now()
+            self._next_keepalive = self._now() + self._keepalive
             self.stats["sent_events"] += 1
 
     def _write_frame(self, value):
@@ -397,10 +469,12 @@ class BridgeClient(object):
             written += sent
 
     def _fail(self, reason):
+        self._clear_delivery()
         self.stats["failures"] += 1
         # In-flight events have an unknown outcome and are never resent.
         self.stats["lost_events"] += len(self._pending)
         self._pending = []
+        self._pending_since.clear()
         self.last_error = reason
         self._close_socket()
         self._inbound = bytearray()
