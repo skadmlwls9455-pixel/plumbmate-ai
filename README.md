@@ -132,5 +132,5 @@ in-game verification on my own machine.
 
 ## License
 
-See [LICENSE](LICENSE). This is a fan project and is not affiliated with or
+Copyright (c) 2026 Katherine Nahm (남의진). All rights reserved. See [LICENSE](LICENSE). This is a fan project and is not affiliated with or
 endorsed by Electronic Arts or Maxis.
